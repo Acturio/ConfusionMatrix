@@ -89,10 +89,10 @@ server <- function(input, output) {
 
     output$ROC <- renderPlot({
 
-        sens <- MLmetrics::Sensitivity(data2()$Pred, data2()$response, positive = "Yes")
-        #sens <- yardstick::sens(data2(), truth = response, estimate = Pred)$.estimate
-        tfp <- 1 - MLmetrics::Specificity(data2()$Pred, data2()$response, positive = "Yes")
-        #tfp <- 1 - yardstick::spec(data2(), truth = response, estimate = Pred)$.estimate
+        #sens <- MLmetrics::Sensitivity(data2()$Pred, data2()$response, positive = "Yes")
+        sens <- yardstick::sens(data2(), truth = response, estimate = Pred)$.estimate
+        #tfp <- 1 - MLmetrics::Specificity(data2()$Pred, data2()$response, positive = "Yes")
+        tfp <- 1 - yardstick::spec(data2(), truth = response, estimate = Pred)$.estimate
 
         ggplot(
             roc_tbl,
@@ -110,10 +110,10 @@ server <- function(input, output) {
 
     output$PR <- renderPlot({
 
-        recall <- MLmetrics::Recall(data2()$Pred, data2()$response, positive = "Yes")
-        #recall <- yardstick::recall(data2(), Pred, response)$.estimate
-        pre <- MLmetrics::Precision(data2()$Pred, data2()$response, positive = "Yes")
-        #pre <- yardstick::precision(data2(), Pred, response)$.estimate
+        #recall <- MLmetrics::Recall(data2()$Pred, data2()$response, positive = "Yes")
+        recall <- yardstick::recall(data2(), Pred, response)$.estimate
+        #pre <- MLmetrics::Precision(data2()$Pred, data2()$response, positive = "Yes")
+        pre <- yardstick::precision(data2(), Pred, response)$.estimate
         
 
         ggplot(
