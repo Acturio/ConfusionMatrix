@@ -5,6 +5,8 @@ library(yardstick)
 library(ggplot2)
 library(MLmetrics)
 
+# Comentario escrito desde la plataforma
+
 # data <- read.csv("probas.csv") %>% select(prob, response) %>% as_tibble()
 # 
 # data <- data %>% dplyr::select(prob, response) %>%
