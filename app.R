@@ -5,14 +5,14 @@ library(yardstick)
 library(ggplot2)
 library(MLmetrics)
 
-data <- read.csv("probas.csv") %>% select(prob, response) %>% as_tibble()
-
-data <- data %>% dplyr::select(prob, response) %>%
-    mutate(response = factor(ifelse(response == 0, "No", "Yes"),
-                          levels = c("Yes","No"), labels = c("Yes","No")))
-
-roc_tbl <- data %>% roc_curve(truth = response, estimate = prob)
-pr_auc_tbl <- data %>% pr_curve(truth = response, estimate = prob)
+# data <- read.csv("probas.csv") %>% select(prob, response) %>% as_tibble()
+# 
+# data <- data %>% dplyr::select(prob, response) %>%
+#     mutate(response = factor(ifelse(response == 0, "No", "Yes"),
+#                           levels = c("Yes","No"), labels = c("Yes","No")))
+# 
+# roc_tbl <- data %>% roc_curve(truth = response, estimate = prob)
+# pr_auc_tbl <- data %>% pr_curve(truth = response, estimate = prob)
 
 ui <- fluidPage(
 
@@ -21,7 +21,7 @@ ui <- fluidPage(
     sidebarLayout(
         sidebarPanel(
             
-            #shiny::fileInput("file", "Ingrese un archivo", accept = ".csv"),
+            shiny::fileInput("file", "Ingrese un archivo", accept = ".csv"),
             
             sliderInput("tresh",
                         "Treshold Probability:",
@@ -41,43 +41,43 @@ ui <- fluidPage(
 
 server <- function(input, output) {
     
-    # data2 <- reactive({
-    # 
-    #     if(is.null(input$file)) return(NULL)
-    # 
-    #     archivo <- input$file
-    #     archivo <- read.csv(archivo$datapath, stringsAsFactors = F, fileEncoding = "utf-8")
-    # 
-    #     archivo %>% dplyr::select(prob, response) %>%
-    #         mutate(
-    #             response = factor(ifelse(
-    #                 response == 0, "No", "Yes"),
-    #                 levels = c("Yes","No"),
-    #                 labels = c("Yes","No")
-    #             ),
-    #             Pred = factor(ifelse(
-    #                 prob > input$tresh, "Yes", "No"),
-    #                 levels = c("Yes","No"),
-    #                 labels = c("Yes","No"))
-    #         )
-    # })
-    # 
-    # roc_tbl <- reactive({
-    #     data2() %>% roc_curve(truth = response, estimate = prob)
-    # })
-    # 
-    # pr_auc_tbl <- reactive({
-    #     data2() %>% pr_curve(truth = response, estimate = prob)
-    # })
-    
-
     data2 <- reactive({
 
-        table <- data %>%
-            mutate(Pred = factor(ifelse(prob > input$tresh, "Yes", "No"),
-                                 levels = c("Yes","No"), labels = c("Yes","No")))
-        table
+        if(is.null(input$file)) return(NULL)
+
+        archivo <- input$file
+        archivo <- read.csv(archivo$datapath, stringsAsFactors = F, fileEncoding = "utf-8")
+
+        archivo %>% dplyr::select(prob, response) %>%
+            mutate(
+                response = factor(ifelse(
+                    response == 0, "No", "Yes"),
+                    levels = c("Yes","No"),
+                    labels = c("Yes","No")
+                ),
+                Pred = factor(ifelse(
+                    prob > input$tresh, "Yes", "No"),
+                    levels = c("Yes","No"),
+                    labels = c("Yes","No"))
+            )
     })
+
+    roc_tbl <- reactive({
+        data2() %>% roc_curve(truth = response, estimate = prob)
+    })
+
+    pr_auc_tbl <- reactive({
+        data2() %>% pr_curve(truth = response, estimate = prob)
+    })
+    
+
+    # data2 <- reactive({
+    # 
+    #     table <- data %>%
+    #         mutate(Pred = factor(ifelse(prob > input$tresh, "Yes", "No"),
+    #                              levels = c("Yes","No"), labels = c("Yes","No")))
+    #     table
+    # })
 
     output$matrix_table <- renderPrint({
 
@@ -95,8 +95,8 @@ server <- function(input, output) {
         tfp <- 1 - yardstick::spec(data2(), truth = response, estimate = Pred)$.estimate
 
         ggplot(
-            roc_tbl,
-            #roc_tbl(), 
+            #roc_tbl,
+            roc_tbl(), 
             aes(x = 1 - specificity, y = sensitivity)) +
             geom_path(aes(colour = .threshold), size = 1.2) +
             geom_abline(colour = "gray") +
@@ -117,8 +117,8 @@ server <- function(input, output) {
         
 
         ggplot(
-            pr_auc_tbl, 
-            #pr_auc_tbl(),
+            #pr_auc_tbl, 
+            pr_auc_tbl(),
             aes(x = recall , y = precision)) +
             geom_path(aes(colour = .threshold), size = 1.2) +
             geom_abline(colour = "gray") +
