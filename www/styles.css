@@ -181,6 +181,7 @@ body {
 
 .cards {
   display: flex;
+  flex-wrap: wrap;
   gap: 14px;
   margin-bottom: 16px;
 }
@@ -190,8 +191,8 @@ body {
   border-left: 4px solid var(--bright-blue);
   border-radius: 9px;
   box-shadow: 0 2px 9px rgba(7, 33, 70, 0.05);
-  flex: 1;
-  padding: 14px 17px;
+  flex: 1 1 108px;
+  padding: 12px 14px;
 }
 
 .kpi-card:nth-child(3),
@@ -207,7 +208,7 @@ body {
 
 .kpi-card strong {
   color: var(--navy);
-  font-size: 25px;
+  font-size: 21px;
   font-weight: 600;
 }
 
@@ -231,6 +232,17 @@ body {
   margin-bottom: 14px;
   min-height: 342px;
   padding: 4px 6px;
+}
+
+.chart-card--titled {
+  padding-top: 12px;
+}
+
+.chart-title {
+  color: var(--navy);
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 12px 4px;
 }
 
 .metrics-card {

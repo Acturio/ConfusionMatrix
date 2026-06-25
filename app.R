@@ -126,6 +126,87 @@ binary_current_tooltip <- function(data, threshold) {
   )
 }
 
+binomial_confidence_interval <- function(positive_count, total_count, confidence_level) {
+  if (total_count == 0) {
+    return(c(lower = NA_real_, upper = NA_real_))
+  }
+
+  alpha <- 1 - confidence_level
+  alpha_half <- alpha / 2
+  lower <- if (positive_count == 0) {
+    0
+  } else {
+    stats::qbeta(alpha_half, positive_count, total_count - positive_count + 1)
+  }
+  upper <- if (positive_count == total_count) {
+    1
+  } else {
+    stats::qbeta(1 - alpha_half, positive_count + 1, total_count - positive_count)
+  }
+
+  c(lower = lower, upper = upper)
+}
+
+probability_bin_table <- function(data, confidence_level_percent = 95) {
+  confidence_level <- pmin(pmax(confidence_level_percent / 100, 0.80), 0.95)
+  alpha <- 1 - confidence_level
+  alpha_half <- alpha / 2
+  breaks <- seq(0, 1, by = 0.1)
+  labels <- paste0(
+    "[", scales::percent(head(breaks, -1), accuracy = 1),
+    ", ", scales::percent(tail(breaks, -1), accuracy = 1),
+    if_else(tail(breaks, -1) == 1, "]", ")")
+  )
+
+  data %>%
+    mutate(
+      score_bin = cut(pmin(score, 1 - 1e-12),
+        breaks = breaks, labels = labels,
+        include.lowest = TRUE, right = FALSE
+      ),
+      positive = truth == levels(truth)[[1]]
+    ) %>%
+    count(score_bin, wt = positive, name = "Positive Count") %>%
+    right_join(
+      data %>%
+        mutate(score_bin = cut(pmin(score, 1 - 1e-12),
+          breaks = breaks, labels = labels,
+          include.lowest = TRUE, right = FALSE
+        )) %>%
+        count(score_bin, name = "Total Count"),
+      by = "score_bin"
+    ) %>%
+    complete(
+      score_bin = factor(labels, levels = labels),
+      fill = list(`Positive Count` = 0, `Total Count` = 0)
+    ) %>%
+    mutate(
+      `Positive Count` = replace_na(`Positive Count`, 0),
+      `Total Count` = replace_na(`Total Count`, 0)
+    ) %>%
+    mutate(
+      `Positive Rate` = if_else(`Total Count` > 0, `Positive Count` / `Total Count`, NA_real_),
+      ci = map2(
+        `Positive Count`, `Total Count`,
+        ~ binomial_confidence_interval(.x, .y, confidence_level)
+      ),
+      `CI Lower` = map_dbl(ci, 1),
+      `CI Upper` = map_dbl(ci, 2),
+      Tooltip = paste0(
+        "<b>Probability Bin: ", score_bin, "</b>",
+        "<br>Total Count: ", `Total Count`,
+        "<br>Positive Count: ", `Positive Count`,
+        "<br>Positive Rate: ", scales::percent(`Positive Rate`, accuracy = 0.1),
+        "<br>", scales::percent(confidence_level, accuracy = 1), " CI: [",
+        scales::percent(`CI Lower`, accuracy = 0.1),
+        ", ", scales::percent(`CI Upper`, accuracy = 0.1), "]",
+        "<br>Alpha: ", scales::number(alpha, accuracy = 0.001),
+        "<br>Alpha / 2: ", scales::number(alpha_half, accuracy = 0.001)
+      )
+    ) %>%
+    select(-ci)
+}
+
 confusion_plot <- function(data) {
   counts <- data %>%
     count(truth, estimate, name = "Count") %>%
@@ -159,10 +240,10 @@ ui <- fluidPage(
     div(
       class = "hero__content",
       tags$p(class = "eyebrow", "MODEL PERFORMANCE STUDIO"),
-      tags$h1("Evaluacion de modelos predictivos"),
+      tags$h1("Predictive Model Evaluation"),
       tags$p(
         class = "hero__subtitle",
-        "Confusion Matrix, ROC Curve y Precision-Recall Curve para modelos binarios y multiclase."
+        "Confusion Matrix, ROC Curve, and Precision-Recall Curve for binary and multiclass models."
       )
     ),
     div(
@@ -177,15 +258,15 @@ ui <- fluidPage(
       width = 3,
       div(
         class = "panel configuration",
-        tags$h2("Configurar analisis"),
+        tags$h2("Analysis Settings"),
         fileInput(
-          "file", "Archivo de resultados (.csv)",
+          "file", "Results file (.csv)",
           accept = c(".csv", "text/csv")
         ),
         radioButtons(
           "model_type",
-          "Tipo de respuesta",
-          choices = c("Dicotomica" = "binary", "Multiclase" = "multiclass"),
+          "Response type",
+          choices = c("Binary" = "binary", "Multiclass" = "multiclass"),
           selected = "binary",
           inline = TRUE
         ),
@@ -195,9 +276,13 @@ ui <- fluidPage(
           sliderInput(
             "threshold", "Threshold probability",
             min = 0, max = 1, value = 0.5, step = 0.01
+          ),
+          numericInput(
+            "confidence_level", "Confidence level (%)",
+            value = 95, min = 80, max = 95, step = 5
           )
         ),
-        actionButton("calculate", "Calcular resultados", class = "btn-calculate"),
+        actionButton("calculate", "Calculate results", class = "btn-calculate"),
         uiOutput("data_notice")
       )
     ),
@@ -206,11 +291,12 @@ ui <- fluidPage(
       uiOutput("summary_cards"),
       div(
         class = "panel results",
-        tags$h2(class = "results__title", "Resultados del modelo"),
+        tags$h2(class = "results__title", "Model Results"),
         fluidRow(
           column(6, div(class = "chart-card", plotlyOutput("roc_plot", height = "330px"))),
           column(6, div(class = "chart-card", plotlyOutput("pr_plot", height = "330px")))
         ),
+        uiOutput("binary_extra_plots"),
         fluidRow(
           column(5, div(class = "chart-card", plotlyOutput("matrix_plot", height = "365px"))),
           column(
@@ -224,7 +310,7 @@ ui <- fluidPage(
         ),
         tags$details(
           class = "data-details",
-          tags$summary("Vista de datos cargados"),
+          tags$summary("Uploaded Data Preview"),
           div(class = "preview-table", tableOutput("preview_table"))
         )
       )
@@ -243,7 +329,7 @@ server <- function(input, output, session) {
         name_repair = "unique"
       ),
       error = function(error) {
-        validate(need(FALSE, paste("No se pudo leer el archivo:", error$message)))
+        validate(need(FALSE, paste("The file could not be read:", error$message)))
       }
     )
   })
@@ -384,7 +470,7 @@ server <- function(input, output, session) {
         ) %>%
         drop_na()
 
-      validate(need(nrow(prepared) > 0, "No hay filas completas para analizar."))
+      validate(need(nrow(prepared) > 0, "No complete rows are available for analysis."))
       validate(need(all(between(prepared$score, 0, 1)), "Probability must be between 0 and 1."))
 
       list(
@@ -413,7 +499,7 @@ server <- function(input, output, session) {
       ) %>%
         drop_na()
 
-      validate(need(nrow(prepared) > 0, "No hay filas completas para analizar."))
+      validate(need(nrow(prepared) > 0, "No complete rows are available for analysis."))
       validate(need(all(map_lgl(prepared[classes], is.numeric)), "Probabilities must be numeric."))
       validate(need(all(map_lgl(prepared[classes], ~ all(between(.x, 0, 1)))), "All probabilities must be between 0 and 1."))
 
@@ -452,9 +538,9 @@ server <- function(input, output, session) {
     req(input$calculate > 0)
     config <- analysis_config()
     if (config$omitted == 0) {
-      tags$p(class = "notice success", "Datos listos para el analisis.")
+      tags$p(class = "notice success", "Data ready for analysis.")
     } else {
-      tags$p(class = "notice", paste(config$omitted, "filas incompletas fueron excluidas."))
+      tags$p(class = "notice", paste(config$omitted, "incomplete rows were excluded."))
     }
   })
 
@@ -472,12 +558,29 @@ server <- function(input, output, session) {
       metrics <- multiclass_metric_values(data, config$classes)
       c(mean(metrics$`ROC AUC`, na.rm = TRUE), mean(metrics$`PR AUC`, na.rm = TRUE))
     }
+    precision_recall_f1 <- if (config$type == "binary") {
+      c(
+        metric_value(ppv_vec, data$truth, data$estimate, event_level = "first"),
+        metric_value(recall_vec, data$truth, data$estimate, event_level = "first"),
+        metric_value(f_meas_vec, data$truth, data$estimate, event_level = "first")
+      )
+    } else {
+      metrics <- multiclass_metric_values(data, config$classes)
+      c(
+        mean(metrics$Precision, na.rm = TRUE),
+        mean(metrics$Sensitivity, na.rm = TRUE),
+        mean(metrics$`F1 Score`, na.rm = TRUE)
+      )
+    }
 
     cards <- tibble(
-      label = c("Observations", "Accuracy", "ROC AUC", "PR AUC"),
+      label = c("Observations", "Accuracy", "Precision", "Recall", "F1 Score", "ROC AUC", "PR AUC"),
       value = c(
         scales::comma(nrow(data)),
         format_metric(accuracy),
+        format_metric(precision_recall_f1[[1]]),
+        format_metric(precision_recall_f1[[2]]),
+        format_metric(precision_recall_f1[[3]]),
         format_metric(auc_values[[1]]),
         format_metric(auc_values[[2]])
       )
@@ -490,6 +593,32 @@ server <- function(input, output, session) {
         tags$p(.x),
         tags$strong(.y)
       ))
+    )
+  })
+
+  output$binary_extra_plots <- renderUI({
+    config <- analysis_config()
+    if (config$type != "binary") {
+      return(NULL)
+    }
+
+    fluidRow(
+      column(
+        6,
+        div(
+          class = "chart-card chart-card--titled",
+          tags$h3(class = "chart-title", "Probability Distribution"),
+          plotlyOutput("probability_distribution_plot", height = "310px")
+        )
+      ),
+      column(
+        6,
+        div(
+          class = "chart-card chart-card--titled",
+          tags$h3(class = "chart-title", "Positive Rate by Probability Bin"),
+          plotlyOutput("positive_rate_bin_plot", height = "310px")
+        )
+      )
     )
   })
 
@@ -613,6 +742,108 @@ server <- function(input, output, session) {
         xaxis = list(title = "Recall", range = c(0, 1)),
         yaxis = list(title = "Precision", range = c(0, 1)),
         legend = list(orientation = "h", x = 0, y = -0.2)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$probability_distribution_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "binary")
+    data <- analysis_data() %>%
+      mutate(
+        Tooltip = paste0(
+          "Actual Class: ", truth,
+          "<br>Predicted Probability: ", scales::number(score, accuracy = 0.001)
+        )
+      )
+
+    plot <- plot_ly() %>%
+      add_histogram(
+        data = data, x = ~score, name = "Overall",
+        histnorm = "probability density", nbinsx = 30,
+        marker = list(color = "#9AA6B2", line = list(color = "white", width = 1)),
+        opacity = 0.55, hovertemplate = paste(
+          "Distribution: Overall",
+          "<br>Probability bin: %{x}",
+          "<br>Density: %{y:.3f}<extra></extra>"
+        )
+      )
+
+    distribution_colors <- set_names(c("#0050A4", "#C43131"), levels(data$truth))
+    for (truth_level in levels(data$truth)) {
+      current_data <- data %>% filter(truth == truth_level)
+      plot <- plot %>%
+        add_histogram(
+          data = current_data, x = ~score, name = paste("Actual Class:", truth_level),
+          histnorm = "probability density", nbinsx = 30,
+          marker = list(color = distribution_colors[[truth_level]]),
+          opacity = 0.55, hovertemplate = paste(
+            "Actual Class: ", truth_level,
+            "<br>Probability bin: %{x}",
+            "<br>Density: %{y:.3f}<extra></extra>"
+          )
+        )
+    }
+
+    plot %>%
+      layout(
+        barmode = "overlay",
+        xaxis = list(title = "Predicted Probability", range = c(0, 1), tickformat = ".0%"),
+        yaxis = list(title = "Density"),
+        legend = list(orientation = "h", x = 0, y = 1.16, xanchor = "left", yanchor = "bottom"),
+        margin = list(t = 36, b = 58, l = 58, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$positive_rate_bin_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "binary")
+    confidence_level_percent <- if (is.null(input$confidence_level)) {
+      95
+    } else {
+      as.numeric(input$confidence_level)
+    }
+    confidence_level_percent <- pmin(pmax(confidence_level_percent, 80), 95)
+    confidence_label <- scales::percent(confidence_level_percent / 100, accuracy = 1)
+    bin_data <- probability_bin_table(analysis_data(), confidence_level_percent)
+
+    plot_ly(bin_data, x = ~score_bin) %>%
+      add_bars(
+        y = ~`Positive Rate`, customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        name = "Positive Rate",
+        marker = list(color = theme_colors$bright_blue, opacity = 0.72),
+        textposition = "none"
+      ) %>%
+      add_markers(
+        y = ~`Positive Rate`, customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        name = paste(confidence_label, "CI"),
+        marker = list(color = theme_colors$navy, size = 7),
+        error_y = list(
+          type = "data",
+          symmetric = FALSE,
+          array = ~`CI Upper` - `Positive Rate`,
+          arrayminus = ~`Positive Rate` - `CI Lower`,
+          color = theme_colors$navy,
+          thickness = 1.4,
+          width = 4
+        )
+      ) %>%
+      layout(
+        xaxis = list(
+          title = "Predicted Probability Bin",
+          tickangle = -30,
+          tickfont = list(size = 10)
+        ),
+        yaxis = list(
+          title = paste("Positive Rate with", confidence_label, "CI"),
+          range = c(0, 1), tickformat = ".0%",
+          tickfont = list(size = 10)
+        ),
+        legend = list(orientation = "h", x = 0, y = 1.16, xanchor = "left", yanchor = "bottom"),
+        margin = list(t = 36, b = 88, l = 68, r = 24)
       ) %>%
       config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
   })

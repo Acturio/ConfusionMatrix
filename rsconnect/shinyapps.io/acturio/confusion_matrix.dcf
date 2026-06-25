@@ -1,0 +1,10 @@
+name: confusion_matrix
+title:
+username: acturio
+account: acturio
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 4518265
+bundleId: 12175942
+url: https://acturio.shinyapps.io/confusion_matrix/
+version: 1
