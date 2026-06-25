@@ -75,6 +75,78 @@ one_vs_rest_data <- function(data, class_name, score) {
     )
 }
 
+multiclass_focus_class <- function(config, selected_class = NULL) {
+  if (!is.null(selected_class) && selected_class %in% config$classes) {
+    return(selected_class)
+  }
+
+  config$classes[[1]]
+}
+
+multiclass_focus_data <- function(config, selected_class = NULL, threshold = NULL) {
+  class_name <- multiclass_focus_class(config, selected_class)
+  score <- as.numeric(config$data[[class_name]])
+  predicted_focus <- if (is.null(threshold)) {
+    config$data$estimate == class_name
+  } else {
+    score >= threshold
+  }
+
+  config$data %>%
+    transmute(
+      truth = factor(if_else(truth == class_name, class_name, "Rest"),
+        levels = c(class_name, "Rest")
+      ),
+      estimate = factor(if_else(predicted_focus, class_name, "Rest"),
+        levels = c(class_name, "Rest")
+      ),
+      score = score
+    )
+}
+
+multiclass_lift_gains_table <- function(data, classes) {
+  map_dfr(classes, function(class_name) {
+    one_vs_rest_data(data, class_name, data[[class_name]]) %>%
+      lift_gains_table() %>%
+      mutate(Class = class_name)
+  })
+}
+
+multiclass_probability_heatmap_table <- function(data, classes) {
+  data %>%
+    select(truth, all_of(classes)) %>%
+    group_by(`Actual Class` = truth) %>%
+    summarise(across(all_of(classes), mean), .groups = "drop") %>%
+    pivot_longer(
+      cols = all_of(classes),
+      names_to = "Probability Class",
+      values_to = "Mean Probability"
+    ) %>%
+    mutate(
+      Tooltip = paste0(
+        "<b>Actual Class: ", `Actual Class`, "</b>",
+        "<br>Probability Class: ", `Probability Class`,
+        "<br>Mean Probability: ", scales::percent(`Mean Probability`, accuracy = 0.1)
+      )
+    )
+}
+
+multiclass_confidence_table <- function(data, classes) {
+  max_probability <- do.call(pmax, c(as.list(data[classes]), list(na.rm = TRUE)))
+
+  data %>%
+    mutate(
+      `Max Probability` = max_probability,
+      Result = if_else(truth == estimate, "Correct", "Incorrect"),
+      Tooltip = paste0(
+        "<b>Prediction Result: ", Result, "</b>",
+        "<br>Actual Class: ", truth,
+        "<br>Predicted Class: ", estimate,
+        "<br>Max Probability: ", scales::percent(`Max Probability`, accuracy = 0.1)
+      )
+    )
+}
+
 multiclass_metric_values <- function(data, classes) {
   map_dfr(classes, function(class_name) {
     class_data <- one_vs_rest_data(data, class_name, data[[class_name]])
@@ -615,6 +687,10 @@ ui <- fluidPage(
             value = 95, min = 80, max = 95, step = 5
           )
         ),
+        conditionalPanel(
+          condition = "input.model_type == 'multiclass'",
+          uiOutput("multiclass_focus_controls")
+        ),
         actionButton("calculate", "Calculate results", class = "btn-calculate"),
         uiOutput("data_notice")
       )
@@ -658,7 +734,9 @@ ui <- fluidPage(
           )
         ),
         uiOutput("binary_extra_plots"),
+        uiOutput("multiclass_extra_plots"),
         uiOutput("business_validation_insights"),
+        uiOutput("multiclass_business_validation_insights"),
         fluidRow(
           column(
             5,
@@ -831,6 +909,45 @@ server <- function(input, output, session) {
     )
   })
 
+  output$multiclass_focus_controls <- renderUI({
+    req(input$model_type == "multiclass", input$truth_col)
+    data <- uploaded_data()
+    classes <- data %>%
+      pull(all_of(input$truth_col)) %>%
+      discard(is.na) %>%
+      as.character() %>%
+      unique()
+    selected_class <- if (!is.null(input$multiclass_focus_class) &&
+      input$multiclass_focus_class %in% classes) {
+      input$multiclass_focus_class
+    } else {
+      dplyr::first(classes, default = "")
+    }
+
+    tagList(
+      selectInput(
+        "multiclass_focus_class",
+        "Class to analyze",
+        choices = classes,
+        selected = selected_class
+      ),
+      sliderInput(
+        "multiclass_threshold",
+        "One-vs-rest threshold",
+        min = 0, max = 1, value = 0.5, step = 0.01
+      ),
+      numericInput(
+        "multiclass_confidence_level",
+        "Confidence level (%)",
+        value = 95, min = 80, max = 95, step = 5
+      ),
+      tags$p(
+        class = "form-hint",
+        "These controls affect selected-class one-vs-rest diagnostics. Multiclass prediction still uses the highest probability."
+      )
+    )
+  })
+
   analysis_config <- eventReactive(input$calculate, {
     data <- uploaded_data()
     validate(need(input$truth_col %in% names(data), "Select the Actual Class column."))
@@ -918,6 +1035,42 @@ server <- function(input, output, session) {
     } else {
       config$data
     }
+  })
+
+  selected_multiclass_class <- reactive({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    multiclass_focus_class(config, input$multiclass_focus_class)
+  })
+
+  selected_multiclass_threshold <- reactive({
+    threshold <- if (is.null(input$multiclass_threshold)) {
+      0.5
+    } else {
+      as.numeric(input$multiclass_threshold)
+    }
+
+    pmin(pmax(threshold, 0), 1)
+  })
+
+  selected_multiclass_confidence_level <- reactive({
+    confidence_level <- if (is.null(input$multiclass_confidence_level)) {
+      95
+    } else {
+      as.numeric(input$multiclass_confidence_level)
+    }
+
+    pmin(pmax(confidence_level, 80), 95)
+  })
+
+  selected_multiclass_data <- reactive({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    multiclass_focus_data(
+      config,
+      selected_multiclass_class(),
+      selected_multiclass_threshold()
+    )
   })
 
   output$data_notice <- renderUI({
@@ -1018,6 +1171,115 @@ server <- function(input, output, session) {
               "Use this to evaluate calibration and observed risk by probability bin.",
               "The diagonal means perfect calibration, the Calibration Curve compares mean predicted probability with observed positive rate, CI markers show uncertainty, and Bin Volume shows how much data supports each bin.",
               "Brier Score measures probability error; lower is better and 0 is perfect."
+            )
+          )
+        )
+      )
+    )
+  })
+
+  output$multiclass_extra_plots <- renderUI({
+    config <- analysis_config()
+    if (config$type != "multiclass") {
+      return(NULL)
+    }
+
+    div(
+      class = "insights-section",
+      tags$h3("Multiclass Overview"),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Class Performance Overview"),
+            plotlyOutput("multiclass_metric_overview_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare one-vs-rest performance across all target classes.",
+                "Precision, Recall, F1 Score, ROC AUC, and PR AUC are calculated per class so weak categories are easier to spot."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Average Probability by Actual Class"),
+            plotlyOutput("multiclass_probability_heatmap_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this heatmap to inspect how probability mass is distributed for each Actual Class.",
+                "A strong model tends to show higher values on the diagonal, meaning each true class receives its own highest average probability."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Actual vs Predicted Class Volume"),
+            plotlyOutput("multiclass_class_volume_plot", height = "310px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare the true class mix against the model's predicted class mix.",
+                "Large gaps can reveal systematic overprediction or underprediction of specific classes."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Prediction Confidence by Result"),
+            plotlyOutput("multiclass_confidence_distribution_plot", height = "310px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to inspect the maximum predicted probability from the winning class.",
+                "Correct predictions should generally have higher confidence than incorrect predictions; high-confidence errors deserve review."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Selected Class Probability Distribution"),
+            plotlyOutput("multiclass_probability_distribution_plot", height = "310px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to analyze the selected class as one-vs-rest.",
+                "The selected class should concentrate toward higher probabilities, while Rest should concentrate toward lower probabilities."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Selected Class Calibration & Positive Rate"),
+            uiOutput("multiclass_calibration_summary"),
+            plotlyOutput("multiclass_calibration_probability_bin_plot", height = "310px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to evaluate whether the selected class probabilities are calibrated.",
+                "The Calibration Curve should follow the diagonal; CI markers show observed positive rate by probability bin and Bin Volume shows support."
+              )
             )
           )
         )
@@ -1132,6 +1394,116 @@ server <- function(input, output, session) {
                 "Use this to choose a threshold with balanced classification quality.",
                 "Matthews Correlation Coefficient (MCC) ranges from -1 to 1 and uses TP, TN, FP, and FN together, making it useful when classes are imbalanced.",
                 "The compact cards show current MCC and the best MCC found across thresholds."
+              )
+            )
+          )
+        )
+      )
+    )
+  })
+
+  output$multiclass_business_validation_insights <- renderUI({
+    config <- analysis_config()
+    if (config$type != "multiclass") {
+      return(NULL)
+    }
+
+    div(
+      class = "insights-section",
+      tags$h3("Multiclass Business Prioritization"),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Cumulative Gains by Class"),
+            plotlyOutput("multiclass_cumulative_gains_plot", height = "320px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare how quickly each class can be captured when records are sorted by that class probability.",
+                "The selected-class marker shows the population share and recall implied by the one-vs-rest threshold."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Lift Curve by Class"),
+            plotlyOutput("multiclass_lift_curve_plot", height = "320px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare enrichment across classes.",
+                "Lift above 1 means a score-ranked segment contains more true cases of that class than random selection."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Selected Class Decile Analysis"),
+            plotlyOutput("multiclass_decile_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to audit score-ranked deciles for the selected class.",
+                "The orange bar marks the decile where the selected one-vs-rest threshold falls."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "metrics-card insights-table-card",
+            tags$h4(class = "chart-title", "Selected Class Decile Summary"),
+            DT::DTOutput("multiclass_decile_table"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this table to inspect the selected class decile counts, average score, positives, Positive Rate, Lift, and Cumulative Recall.",
+                "It shows how much of the class is captured as you move from high-score to low-score records."
+              )
+            )
+          )
+        )
+      ),
+      tags$h3("Selected Class Validation Diagnostics"),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Selected Class KS Curve"),
+            plotlyOutput("multiclass_ks_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this one-vs-rest KS Curve to assess separation for the selected class.",
+                "The maximum KS threshold highlights where positives and Rest are most separated by score."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Selected Class MCC vs Threshold"),
+            uiOutput("multiclass_mcc_summary"),
+            plotlyOutput("multiclass_mcc_threshold_plot", height = "300px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to tune the selected class one-vs-rest threshold.",
+                "MCC balances true positives, true negatives, false positives, and false negatives, which is useful when class frequencies differ."
               )
             )
           )
@@ -1667,6 +2039,590 @@ server <- function(input, output, session) {
         tags$p("Current MCC"),
         tags$strong(format_metric(current_mcc)),
         tags$span(paste("Thr.", scales::number(input$threshold, accuracy = 0.001)))
+      ),
+      div(
+        class = "mini-kpi",
+        tags$p("Best MCC"),
+        tags$strong(format_metric(best_mcc)),
+        tags$span(paste("Thr.", format_metric(best_threshold)))
+      )
+    )
+  })
+
+  output$multiclass_metric_overview_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    metric_data <- multiclass_metric_values(analysis_data(), config$classes) %>%
+      pivot_longer(-Class, names_to = "Metric", values_to = "Value") %>%
+      filter(Metric %in% c("Precision", "Sensitivity", "F1 Score", "ROC AUC", "PR AUC")) %>%
+      mutate(
+        Metric = recode(Metric, Sensitivity = "Recall"),
+        Tooltip = paste0(
+          "<b>Class: ", Class, "</b>",
+          "<br>Metric: ", Metric,
+          "<br>Value: ", scales::number(Value, accuracy = 0.001)
+        )
+      )
+
+    plot_ly(
+      metric_data,
+      x = ~Class,
+      y = ~Value,
+      color = ~Metric,
+      colors = c(theme_colors$bright_blue, theme_colors$aqua, "#F7893B", "#7C53A5", "#5BBF7A"),
+      type = "bar",
+      text = ~Tooltip,
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        barmode = "group",
+        yaxis = list(title = "Metric Value", range = c(0, 1), tickformat = ".0%"),
+        xaxis = list(title = "Class"),
+        legend = list(orientation = "h", x = 0, y = -0.24),
+        margin = list(t = 28, b = 90, l = 58, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_probability_heatmap_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    heatmap_data <- multiclass_probability_heatmap_table(analysis_data(), config$classes)
+    heatmap_wide <- heatmap_data %>%
+      select(`Actual Class`, `Probability Class`, `Mean Probability`) %>%
+      pivot_wider(names_from = `Probability Class`, values_from = `Mean Probability`) %>%
+      arrange(factor(`Actual Class`, levels = config$classes))
+    z_matrix <- as.matrix(heatmap_wide[, config$classes])
+    rownames(z_matrix) <- heatmap_wide$`Actual Class`
+
+    plot_ly(
+      x = colnames(z_matrix),
+      y = rownames(z_matrix),
+      z = z_matrix,
+      type = "heatmap",
+      zmin = 0,
+      zmax = 1,
+      colors = c("#EAF4FB", theme_colors$bright_blue),
+      hovertemplate = paste(
+        "Actual Class: %{y}",
+        "<br>Probability Class: %{x}",
+        "<br>Mean Probability: %{z:.1%}<extra></extra>"
+      )
+    ) %>%
+      layout(
+        xaxis = list(title = "Probability Class"),
+        yaxis = list(title = "Actual Class"),
+        margin = list(t = 28, b = 72, l = 82, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_class_volume_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- analysis_data()
+    volume_data <- bind_rows(
+      data %>%
+        count(Class = truth, name = "Count") %>%
+        mutate(Type = "Actual"),
+      data %>%
+        count(Class = estimate, name = "Count") %>%
+        mutate(Type = "Predicted")
+    ) %>%
+      complete(
+        Class = factor(config$classes, levels = config$classes),
+        Type = c("Actual", "Predicted"),
+        fill = list(Count = 0)
+      ) %>%
+      mutate(
+        Class = factor(Class, levels = config$classes),
+        Tooltip = paste0(
+          "<b>", Type, " Class Volume</b>",
+          "<br>Class: ", Class,
+          "<br>Count: ", scales::comma(Count)
+        )
+      )
+
+    plot_ly(
+      volume_data,
+      x = ~Class,
+      y = ~Count,
+      color = ~Type,
+      colors = c(theme_colors$bright_blue, theme_colors$aqua),
+      type = "bar",
+      text = ~Tooltip,
+      hoverinfo = "text"
+    ) %>%
+      layout(
+        barmode = "group",
+        xaxis = list(title = "Class"),
+        yaxis = list(title = "Observations", rangemode = "tozero"),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_confidence_distribution_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    confidence_data <- multiclass_confidence_table(analysis_data(), config$classes)
+
+    plot_ly() %>%
+      add_histogram(
+        data = confidence_data,
+        x = ~`Max Probability`,
+        color = ~Result,
+        colors = c(Correct = theme_colors$bright_blue, Incorrect = "#C43131"),
+        histnorm = "probability density",
+        nbinsx = 30,
+        opacity = 0.62,
+        hovertemplate = paste(
+          "Prediction Result: %{fullData.name}",
+          "<br>Max Probability bin: %{x}",
+          "<br>Density: %{y:.3f}<extra></extra>"
+        )
+      ) %>%
+      layout(
+        barmode = "overlay",
+        xaxis = continuous_x_axis("Max Predicted Probability", percent = TRUE),
+        yaxis = list(title = "Density"),
+        legend = list(orientation = "h", x = 0, y = 1.16, xanchor = "left", yanchor = "bottom"),
+        margin = list(t = 36, b = 58, l = 58, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_probability_distribution_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    focus_class <- selected_multiclass_class()
+    data <- selected_multiclass_data()
+
+    plot <- plot_ly() %>%
+      add_histogram(
+        data = data, x = ~score, name = "Overall",
+        histnorm = "probability density", nbinsx = 30,
+        marker = list(color = "#9AA6B2", line = list(color = "white", width = 1)),
+        opacity = 0.55,
+        hovertemplate = paste(
+          "Distribution: Overall",
+          "<br>Probability bin: %{x}",
+          "<br>Density: %{y:.3f}<extra></extra>"
+        )
+      )
+
+    distribution_colors <- set_names(c("#0050A4", "#C43131"), levels(data$truth))
+    for (truth_level in levels(data$truth)) {
+      current_data <- data %>% filter(truth == truth_level)
+      plot <- plot %>%
+        add_histogram(
+          data = current_data, x = ~score, name = paste("Actual:", truth_level),
+          histnorm = "probability density", nbinsx = 30,
+          marker = list(color = distribution_colors[[truth_level]]),
+          opacity = 0.55,
+          hovertemplate = paste(
+            "Selected Class: ", focus_class,
+            "<br>Actual Group: ", truth_level,
+            "<br>Probability bin: %{x}",
+            "<br>Density: %{y:.3f}<extra></extra>"
+          )
+        )
+    }
+
+    plot %>%
+      layout(
+        barmode = "overlay",
+        xaxis = continuous_x_axis(paste("Predicted Probability for", focus_class), percent = TRUE),
+        yaxis = list(title = "Density"),
+        legend = list(orientation = "h", x = 0, y = 1.16, xanchor = "left", yanchor = "bottom"),
+        margin = list(t = 36, b = 58, l = 58, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_calibration_summary <- renderUI({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    div(
+      class = "insight-metric",
+      tags$span(paste("Class", selected_multiclass_class(), "| Brier Score (lower is better)")),
+      tags$strong(format_metric(brier_score_value(selected_multiclass_data())))
+    )
+  })
+
+  output$multiclass_calibration_probability_bin_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    focus_class <- selected_multiclass_class()
+    confidence_level_percent <- selected_multiclass_confidence_level()
+    confidence_label <- scales::percent(confidence_level_percent / 100, accuracy = 1)
+    data <- selected_multiclass_data()
+    bin_data <- probability_bin_table(data, confidence_level_percent)
+    calibration <- calibration_table(data)
+    observed <- calibration %>% filter(Observations > 0)
+
+    plot_ly() %>%
+      add_trace(
+        x = c(0, 1), y = c(0, 1), type = "scatter", mode = "lines",
+        name = "Perfect Calibration", hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash", width = 2)
+      ) %>%
+      add_trace(
+        data = observed,
+        x = ~`Mean Predicted Probability`,
+        y = ~`Observed Positive Rate`,
+        text = ~Tooltip,
+        type = "scatter", mode = "lines+markers",
+        name = "Calibration Curve",
+        hoverinfo = "text",
+        line = list(color = theme_colors$bright_blue, width = 2.3),
+        marker = list(color = theme_colors$bright_blue, size = 8)
+      ) %>%
+      add_markers(
+        data = bin_data,
+        x = ~bin_midpoint,
+        y = ~`Positive Rate`,
+        customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        name = paste("Positive Rate", confidence_label, "CI"),
+        marker = list(color = theme_colors$navy, size = 7),
+        error_y = list(
+          type = "data",
+          symmetric = FALSE,
+          array = ~`CI Upper` - `Positive Rate`,
+          arrayminus = ~`Positive Rate` - `CI Lower`,
+          color = theme_colors$navy,
+          thickness = 1.4,
+          width = 4
+        )
+      ) %>%
+      add_bars(
+        data = bin_data,
+        x = ~bin_midpoint,
+        y = ~`Total Count`,
+        customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        name = "Bin Volume",
+        yaxis = "y2",
+        width = 0.075,
+        marker = list(color = "#9AA6B2", opacity = 0.35),
+        textposition = "none"
+      ) %>%
+      layout(
+        xaxis = continuous_x_axis(paste("Predicted Probability for", focus_class), percent = TRUE),
+        yaxis = list(
+          title = "Observed Positive Rate",
+          range = c(0, 1),
+          tickformat = ".0%",
+          tickfont = list(size = 10)
+        ),
+        yaxis2 = list(
+          title = "Bin Volume",
+          overlaying = "y",
+          side = "right",
+          showgrid = FALSE,
+          rangemode = "tozero"
+        ),
+        legend = list(orientation = "h", x = 0, y = 1.16, xanchor = "left", yanchor = "bottom"),
+        margin = list(t = 42, b = 62, l = 68, r = 68),
+        barmode = "overlay"
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_cumulative_gains_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- analysis_data()
+    gains <- multiclass_lift_gains_table(data, config$classes)
+    colors <- curve_colors(config$classes)
+    focus_class <- selected_multiclass_class()
+    threshold <- selected_multiclass_threshold()
+    selected <- threshold_capture_summary(selected_multiclass_data(), threshold) %>%
+      mutate(Tooltip = paste0("<b>Selected Class: ", focus_class, "</b><br>", Tooltip))
+
+    plot <- plot_ly() %>%
+      add_trace(
+        x = c(0, 1), y = c(0, 1), type = "scatter", mode = "lines",
+        name = "Random Baseline", hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash"),
+        showlegend = FALSE
+      )
+
+    for (class_name in config$classes) {
+      current_curve <- gains %>% filter(Class == class_name)
+      plot <- plot %>%
+        add_trace(
+          data = current_curve,
+          x = ~cumulative_population,
+          y = ~cumulative_recall,
+          text = ~Tooltip,
+          type = "scatter",
+          mode = "lines",
+          name = class_name,
+          hoverinfo = "text",
+          line = list(color = colors[[class_name]], width = 2.3)
+        )
+    }
+
+    plot %>%
+      add_trace(
+        data = selected, x = ~population_pct, y = ~cumulative_recall,
+        text = ~Tooltip, type = "scatter", mode = "markers",
+        name = "Selected Threshold", hoverinfo = "text",
+        marker = list(color = "white", line = list(color = theme_colors$navy, width = 3), size = 12)
+      ) %>%
+      layout(
+        xaxis = continuous_x_axis("Cumulative Population", percent = TRUE),
+        yaxis = list(title = "Cumulative Positives Captured", tickformat = ".0%", range = c(0, 1)),
+        legend = list(orientation = "h", x = 0, y = -0.24),
+        margin = list(t = 24, b = 80, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_lift_curve_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- analysis_data()
+    gains <- multiclass_lift_gains_table(data, config$classes) %>%
+      filter(!is.na(cumulative_lift))
+    colors <- curve_colors(config$classes)
+    focus_class <- selected_multiclass_class()
+    threshold <- selected_multiclass_threshold()
+    selected <- threshold_capture_summary(selected_multiclass_data(), threshold) %>%
+      mutate(Tooltip = paste0("<b>Selected Class: ", focus_class, "</b><br>", Tooltip))
+
+    plot <- plot_ly() %>%
+      add_trace(
+        x = c(0, 1), y = c(1, 1), type = "scatter", mode = "lines",
+        name = "No Lift Baseline", hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash"),
+        showlegend = FALSE
+      )
+
+    for (class_name in config$classes) {
+      current_curve <- gains %>% filter(Class == class_name)
+      plot <- plot %>%
+        add_trace(
+          data = current_curve,
+          x = ~cumulative_population,
+          y = ~cumulative_lift,
+          text = ~Tooltip,
+          type = "scatter",
+          mode = "lines",
+          name = class_name,
+          hoverinfo = "text",
+          line = list(color = colors[[class_name]], width = 2.3)
+        )
+    }
+
+    plot %>%
+      add_trace(
+        data = selected, x = ~population_pct, y = ~lift,
+        text = ~Tooltip, type = "scatter", mode = "markers",
+        name = "Selected Threshold", hoverinfo = "text",
+        marker = list(color = "white", line = list(color = theme_colors$navy, width = 3), size = 12)
+      ) %>%
+      layout(
+        xaxis = continuous_x_axis("Cumulative Population", percent = TRUE),
+        yaxis = list(title = "Cumulative Lift", rangemode = "tozero"),
+        legend = list(orientation = "h", x = 0, y = -0.24),
+        margin = list(t = 24, b = 80, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_decile_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    deciles <- decile_analysis_table(selected_multiclass_data(), selected_multiclass_threshold())
+    bar_colors <- if_else(deciles$`Current Threshold Decile`, "#F7893B", theme_colors$bright_blue)
+
+    plot_ly(deciles, x = ~factor(decile, levels = 1:10)) %>%
+      add_bars(
+        y = ~`Positive Rate`, customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        name = "Positive Rate",
+        marker = list(color = bar_colors, opacity = 0.78),
+        textposition = "none"
+      ) %>%
+      add_trace(
+        y = ~Lift, customdata = ~Tooltip,
+        hovertemplate = "%{customdata}<extra></extra>",
+        type = "scatter", mode = "lines+markers",
+        name = "Decile Lift", yaxis = "y2",
+        line = list(color = theme_colors$navy, width = 2),
+        marker = list(color = theme_colors$navy, size = 7)
+      ) %>%
+      layout(
+        xaxis = list(title = paste("Decile for", selected_multiclass_class(), "(1 = Highest Scores)")),
+        yaxis = list(title = "Positive Rate", tickformat = ".0%", range = c(0, 1)),
+        yaxis2 = list(title = "Lift", overlaying = "y", side = "right", rangemode = "tozero"),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 64)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_decile_table <- DT::renderDT({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    deciles <- decile_analysis_table(selected_multiclass_data(), selected_multiclass_threshold())
+    current_decile <- current_threshold_decile(selected_multiclass_data(), selected_multiclass_threshold())
+    display <- deciles %>%
+      transmute(
+        Decile = decile,
+        Observations,
+        `Average Score`,
+        Positives,
+        `Positive Rate`,
+        Lift,
+        `Cumulative Positives`,
+        `Cumulative Recall`
+      )
+
+    DT::datatable(
+      display,
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = 10, scrollX = TRUE)
+    ) %>%
+      DT::formatRound(c("Average Score", "Lift"), digits = 3) %>%
+      DT::formatPercentage(c("Positive Rate", "Cumulative Recall"), digits = 1) %>%
+      DT::formatStyle(
+        "Decile",
+        target = "row",
+        backgroundColor = DT::styleEqual(current_decile, "#EAF4FB")
+      )
+  })
+
+  output$multiclass_ks_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- selected_multiclass_data()
+    ks_data <- ks_table(data)
+    selected <- ks_at_threshold(data, selected_multiclass_threshold())
+    max_ks <- ks_data %>%
+      filter(!is.na(KS)) %>%
+      slice_max(KS, n = 1, with_ties = FALSE)
+
+    plot <- plot_ly() %>%
+      add_trace(
+        data = ks_data, x = ~score, y = ~TPR, text = ~Tooltip,
+        type = "scatter", mode = "lines", name = "TPR",
+        hoverinfo = "text", line = list(color = theme_colors$bright_blue, width = 2.3)
+      ) %>%
+      add_trace(
+        data = ks_data, x = ~score, y = ~FPR, text = ~Tooltip,
+        type = "scatter", mode = "lines", name = "FPR",
+        hoverinfo = "text", line = list(color = "#C43131", width = 2.3)
+      ) %>%
+      add_trace(
+        data = selected, x = ~score, y = ~TPR, text = ~Tooltip,
+        type = "scatter", mode = "markers", name = "Selected Threshold",
+        hoverinfo = "text",
+        marker = list(color = "white", line = list(color = theme_colors$navy, width = 3), size = 12)
+      )
+
+    if (nrow(max_ks) > 0) {
+      plot <- plot %>%
+        add_trace(
+          x = c(max_ks$score, max_ks$score), y = c(0, 1),
+          type = "scatter", mode = "lines", name = "Max KS Threshold",
+          hoverinfo = "text", text = max_ks$Tooltip,
+          line = list(color = "#F7893B", dash = "dash", width = 2)
+        ) %>%
+        add_annotations(
+          x = max_ks$score, y = 1,
+          text = paste0("Max KS: ", scales::number(max_ks$KS, accuracy = 0.001)),
+          showarrow = TRUE, arrowhead = 2, ax = 20, ay = -28
+        )
+    }
+
+    plot %>%
+      layout(
+        xaxis = continuous_x_axis(paste("Threshold for", selected_multiclass_class())),
+        yaxis = list(title = "Cumulative Distribution", range = c(0, 1)),
+        legend = list(orientation = "h", x = 0, y = -0.24),
+        margin = list(t = 36, b = 80, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_mcc_threshold_plot <- renderPlotly({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- selected_multiclass_data()
+    threshold <- selected_multiclass_threshold()
+    mcc_values <- mcc_threshold_table(data)
+    current <- tibble(
+      threshold = threshold,
+      MCC = mcc_value(data, threshold),
+      Tooltip = paste0(
+        "<b>Selected Class: ", selected_multiclass_class(), "</b>",
+        "<br>Selected Threshold: ", scales::number(threshold, accuracy = 0.001),
+        "<br>MCC: ", format_metric(mcc_value(data, threshold))
+      )
+    )
+    best <- mcc_values %>%
+      filter(!is.na(MCC)) %>%
+      slice_max(MCC, n = 1, with_ties = FALSE)
+
+    plot <- plot_ly(mcc_values, x = ~threshold, y = ~MCC, text = ~Tooltip) %>%
+      add_trace(
+        type = "scatter", mode = "lines",
+        name = "MCC", hoverinfo = "text",
+        line = list(color = theme_colors$bright_blue, width = 2.3)
+      ) %>%
+      add_trace(
+        data = current, x = ~threshold, y = ~MCC, text = ~Tooltip,
+        type = "scatter", mode = "markers",
+        name = "Selected Threshold", hoverinfo = "text",
+        marker = list(color = "white", line = list(color = theme_colors$navy, width = 3), size = 12)
+      )
+
+    if (nrow(best) > 0) {
+      plot <- plot %>%
+        add_trace(
+          data = best, x = ~threshold, y = ~MCC, text = ~Tooltip,
+          type = "scatter", mode = "markers",
+          name = "Best MCC Threshold", hoverinfo = "text",
+          marker = list(color = "#F7893B", line = list(color = theme_colors$navy, width = 1), size = 11)
+        )
+    }
+
+    plot %>%
+      layout(
+        xaxis = continuous_x_axis(paste("Threshold for", selected_multiclass_class())),
+        yaxis = list(title = "MCC", range = c(-1, 1)),
+        legend = list(orientation = "h", x = 0, y = -0.24),
+        margin = list(t = 26, b = 80, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$multiclass_mcc_summary <- renderUI({
+    config <- analysis_config()
+    req(config$type == "multiclass")
+    data <- selected_multiclass_data()
+    threshold <- selected_multiclass_threshold()
+    mcc_values <- mcc_threshold_table(data)
+    current_mcc <- mcc_value(data, threshold)
+    best <- mcc_values %>%
+      filter(!is.na(MCC)) %>%
+      slice_max(MCC, n = 1, with_ties = FALSE)
+
+    best_mcc <- if (nrow(best) == 0) NA_real_ else best$MCC[[1]]
+    best_threshold <- if (nrow(best) == 0) NA_real_ else best$threshold[[1]]
+
+    div(
+      class = "mini-kpi-grid",
+      div(
+        class = "mini-kpi",
+        tags$p("Current MCC"),
+        tags$strong(format_metric(current_mcc)),
+        tags$span(paste("Thr.", scales::number(threshold, accuracy = 0.001)))
       ),
       div(
         class = "mini-kpi",
