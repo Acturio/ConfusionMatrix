@@ -41,6 +41,236 @@ continuous_x_axis <- function(title, percent = FALSE) {
   axis
 }
 
+safe_mean <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  mean(x, na.rm = TRUE)
+}
+
+safe_median <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  median(x, na.rm = TRUE)
+}
+
+safe_correlation <- function(x, y, method = "pearson") {
+  complete <- complete.cases(x, y)
+  x <- x[complete]
+  y <- y[complete]
+
+  if (length(x) < 3 || stats::sd(x) == 0 || stats::sd(y) == 0) {
+    return(NA_real_)
+  }
+
+  suppressWarnings(stats::cor(x, y, method = method))
+}
+
+format_percent_metric <- function(x) {
+  if_else(is.na(x), "-", scales::percent(x, accuracy = 0.1))
+}
+
+regression_range <- function(data) {
+  values <- c(data$actual, data$predicted)
+  values <- values[is.finite(values)]
+
+  if (length(values) == 0) {
+    return(c(0, 1))
+  }
+
+  range_values <- range(values, na.rm = TRUE)
+  padding <- diff(range_values) * 0.05
+  if (is.na(padding) || padding == 0) {
+    padding <- max(abs(range_values), 1) * 0.05
+  }
+
+  range_values + c(-padding, padding)
+}
+
+regression_log_available <- function(data) {
+  all(data$actual > 0, data$predicted > 0, na.rm = TRUE)
+}
+
+regression_outlier_limit <- function(absolute_error) {
+  absolute_error <- absolute_error[is.finite(absolute_error)]
+
+  if (length(absolute_error) < 4) {
+    return(Inf)
+  }
+
+  q1 <- stats::quantile(absolute_error, 0.25, na.rm = TRUE, names = FALSE)
+  q3 <- stats::quantile(absolute_error, 0.75, na.rm = TRUE, names = FALSE)
+  iqr <- q3 - q1
+
+  if (is.na(iqr) || iqr == 0) {
+    return(Inf)
+  }
+
+  q3 + 1.5 * iqr
+}
+
+regression_add_diagnostics <- function(data, tolerance = 0) {
+  outlier_limit <- regression_outlier_limit(abs(data$predicted - data$actual))
+
+  data %>%
+    mutate(
+      error = predicted - actual,
+      absolute_error = abs(error),
+      percentage_error = if_else(actual == 0, NA_real_, error / actual),
+      APE = abs(percentage_error),
+      sAPE = if_else(
+        abs(actual) + abs(predicted) == 0,
+        NA_real_,
+        2 * absolute_error / (abs(actual) + abs(predicted))
+      ),
+      within_tolerance = absolute_error <= tolerance,
+      is_outlier = absolute_error > outlier_limit,
+      Tooltip = paste0(
+        "<b>Regression Prediction</b>",
+        "<br>Actual: ", scales::number(actual, accuracy = 0.001),
+        "<br>Predicted: ", scales::number(predicted, accuracy = 0.001),
+        "<br>Error: ", scales::number(error, accuracy = 0.001),
+        "<br>Absolute Error: ", scales::number(absolute_error, accuracy = 0.001)
+      )
+    )
+}
+
+regression_metric_values <- function(data, tolerance = 0) {
+  total_ss <- sum((data$actual - mean(data$actual, na.rm = TRUE))^2, na.rm = TRUE)
+  residual_ss <- sum((data$actual - data$predicted)^2, na.rm = TRUE)
+  absolute_actual_sum <- sum(abs(data$actual), na.rm = TRUE)
+
+  tibble(
+    Metric = c(
+      "MAE", "RMSE", "Median Absolute Error", "Bias",
+      "R2", "Pearson Correlation", "Spearman Correlation",
+      "WAPE", "MAPE", "sMAPE", "% Within Tolerance"
+    ),
+    Value = c(
+      safe_mean(data$absolute_error),
+      sqrt(safe_mean(data$error^2)),
+      safe_median(data$absolute_error),
+      safe_mean(data$error),
+      if_else(total_ss == 0, NA_real_, 1 - residual_ss / total_ss),
+      safe_correlation(data$actual, data$predicted, method = "pearson"),
+      safe_correlation(data$actual, data$predicted, method = "spearman"),
+      if_else(absolute_actual_sum == 0, NA_real_, sum(data$absolute_error, na.rm = TRUE) / absolute_actual_sum),
+      safe_mean(data$APE),
+      safe_mean(data$sAPE),
+      safe_mean(data$within_tolerance)
+    )
+  )
+}
+
+regression_metric_table <- function(data, tolerance = 0) {
+  regression_metric_values(data, tolerance) %>%
+    mutate(
+      Value = case_when(
+        Metric %in% c("WAPE", "MAPE", "sMAPE", "% Within Tolerance") ~ format_percent_metric(Value),
+        TRUE ~ format_metric(Value)
+      )
+    )
+}
+
+regression_error_cdf_table <- function(data) {
+  data %>%
+    filter(!is.na(absolute_error)) %>%
+    arrange(absolute_error) %>%
+    mutate(
+      cumulative_share = row_number() / n(),
+      Tooltip = paste0(
+        "<b>Absolute Error: ", scales::number(absolute_error, accuracy = 0.001), "</b>",
+        "<br>Cumulative Share: ", scales::percent(cumulative_share, accuracy = 0.1)
+      )
+    )
+}
+
+regression_calibration_table <- function(data, bins = 10) {
+  bin_count <- min(max(as.integer(bins), 1), nrow(data))
+  if (bin_count < 1) {
+    return(tibble())
+  }
+
+  data %>%
+    arrange(predicted) %>%
+    mutate(bin = pmin(bin_count, ceiling(row_number() * bin_count / n()))) %>%
+    group_by(bin) %>%
+    summarise(
+      Observations = n(),
+      `Mean Predicted` = mean(predicted),
+      `Mean Actual` = mean(actual),
+      `Mean Error` = mean(error),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Tooltip = paste0(
+        "<b>Bin: ", bin, "</b>",
+        "<br>Observations: ", Observations,
+        "<br>Mean Prediction: ", scales::number(`Mean Predicted`, accuracy = 0.001),
+        "<br>Mean Actual: ", scales::number(`Mean Actual`, accuracy = 0.001),
+        "<br>Mean Error: ", scales::number(`Mean Error`, accuracy = 0.001)
+      )
+    )
+}
+
+regression_quantile_table <- function(data, bins = 10, sort_by = "actual") {
+  bin_count <- min(max(as.integer(bins), 1), nrow(data))
+  sort_column <- if_else(sort_by == "predicted", "predicted", "actual")
+
+  if (bin_count < 1) {
+    return(tibble())
+  }
+
+  data %>%
+    arrange(.data[[sort_column]]) %>%
+    mutate(Quantile = pmin(bin_count, ceiling(row_number() * bin_count / n()))) %>%
+    group_by(Quantile) %>%
+    summarise(
+      Observations = n(),
+      `Mean Actual` = mean(actual),
+      `Mean Predicted` = mean(predicted),
+      MAE = mean(absolute_error),
+      RMSE = sqrt(mean(error^2)),
+      MedAE = median(absolute_error),
+      Bias = mean(error),
+      R2 = {
+        total_ss <- sum((actual - mean(actual))^2)
+        residual_ss <- sum((actual - predicted)^2)
+        if (total_ss == 0) NA_real_ else 1 - residual_ss / total_ss
+      },
+      WAPE = if_else(sum(abs(actual)) == 0, NA_real_, sum(absolute_error) / sum(abs(actual))),
+      MAPE = safe_mean(APE),
+      sMAPE = safe_mean(sAPE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Tooltip = paste0(
+        "<b>Quantile: ", Quantile, "</b>",
+        "<br>Observations: ", Observations,
+        "<br>Mean Actual: ", scales::number(`Mean Actual`, accuracy = 0.001),
+        "<br>Mean Predicted: ", scales::number(`Mean Predicted`, accuracy = 0.001),
+        "<br>MAE: ", scales::number(MAE, accuracy = 0.001),
+        "<br>RMSE: ", scales::number(RMSE, accuracy = 0.001),
+        "<br>Bias: ", scales::number(Bias, accuracy = 0.001),
+        "<br>R2: ", scales::number(R2, accuracy = 0.001),
+        "<br>WAPE: ", scales::percent(WAPE, accuracy = 0.1),
+        "<br>MAPE: ", scales::percent(MAPE, accuracy = 0.1)
+      )
+    )
+}
+
+regression_metric_column <- function(metric) {
+  recode(
+    metric,
+    "Median Absolute Error" = "MedAE",
+    "MedAE" = "MedAE",
+    .default = metric
+  )
+}
+
 binary_metric_table <- function(data) {
   tibble(
     Metric = c(
@@ -664,32 +894,67 @@ ui <- fluidPage(
       div(
         class = "panel configuration",
         tags$h2("Analysis Settings"),
+        radioButtons(
+          "analysis_type",
+          "Model task",
+          choices = c("Classification" = "classification", "Regression" = "regression"),
+          selected = "classification",
+          inline = TRUE
+        ),
         fileInput(
           "file", "Results file (.csv)",
           accept = c(".csv", "text/csv")
         ),
-        radioButtons(
-          "model_type",
-          "Response type",
-          choices = c("Binary" = "binary", "Multiclass" = "multiclass"),
-          selected = "binary",
-          inline = TRUE
-        ),
-        uiOutput("column_selectors"),
         conditionalPanel(
-          condition = "input.model_type == 'binary'",
-          sliderInput(
-            "threshold", "Threshold probability",
-            min = 0, max = 1, value = 0.5, step = 0.01
+          condition = "input.analysis_type == 'classification'",
+          radioButtons(
+            "model_type",
+            "Response type",
+            choices = c("Binary" = "binary", "Multiclass" = "multiclass"),
+            selected = "binary",
+            inline = TRUE
           ),
-          numericInput(
-            "confidence_level", "Confidence level (%)",
-            value = 95, min = 80, max = 95, step = 5
+          uiOutput("column_selectors"),
+          conditionalPanel(
+            condition = "input.analysis_type == 'classification' && input.model_type == 'binary'",
+            sliderInput(
+              "threshold", "Threshold probability",
+              min = 0, max = 1, value = 0.5, step = 0.01
+            ),
+            numericInput(
+              "confidence_level", "Confidence level (%)",
+              value = 95, min = 80, max = 95, step = 5
+            )
+          ),
+          conditionalPanel(
+            condition = "input.analysis_type == 'classification' && input.model_type == 'multiclass'",
+            uiOutput("multiclass_focus_controls")
           )
         ),
         conditionalPanel(
-          condition = "input.model_type == 'multiclass'",
-          uiOutput("multiclass_focus_controls")
+          condition = "input.analysis_type == 'regression'",
+          uiOutput("regression_column_selectors"),
+          uiOutput("regression_tolerance_input"),
+          selectInput(
+            "regression_bins",
+            "Bins / quantiles",
+            choices = c("5" = 5, "10" = 10, "20" = 20),
+            selected = 10
+          ),
+          selectInput(
+            "regression_main_metric",
+            "Main metric",
+            choices = c("MAE", "RMSE", "MedAE", "Bias", "R2", "WAPE", "MAPE", "sMAPE"),
+            selected = "RMSE"
+          ),
+          selectInput(
+            "regression_quantile_sort",
+            "Quantile sort",
+            choices = c("Actual" = "actual", "Predicted" = "predicted"),
+            selected = "actual"
+          ),
+          checkboxInput("regression_show_outliers", "Show outlier highlight", value = TRUE),
+          checkboxInput("regression_log_scale", "Use log scale when valid", value = FALSE)
         ),
         actionButton("calculate", "Calculate results", class = "btn-calculate"),
         uiOutput("data_notice")
@@ -701,80 +966,97 @@ ui <- fluidPage(
       div(
         class = "panel results",
         tags$h2(class = "results__title", "Model Results"),
-        fluidRow(
-          column(
-            6,
-            div(
-              class = "chart-card",
-              plotlyOutput("roc_plot", height = "330px"),
-              tags$p(
-                class = "chart-description",
-                paste(
-                  "Use this to evaluate rank separation across thresholds.",
-                  "The ROC Curve plots Sensitivity against False Positive Rate; stronger models bend toward the upper-left corner.",
-                  "The highlighted marker shows the operating point produced by the current threshold."
+        conditionalPanel(
+          condition = "input.analysis_type == 'classification'",
+          fluidRow(
+            column(
+              6,
+              div(
+                class = "chart-card",
+                plotlyOutput("roc_plot", height = "330px"),
+                tags$p(
+                  class = "chart-description",
+                  paste(
+                    "Use this to evaluate rank separation across thresholds.",
+                    "The ROC Curve plots Sensitivity against False Positive Rate; stronger models bend toward the upper-left corner.",
+                    "The highlighted marker shows the operating point produced by the current threshold."
+                  )
+                )
+              )
+            ),
+            column(
+              6,
+              div(
+                class = "chart-card",
+                plotlyOutput("pr_plot", height = "330px"),
+                tags$p(
+                  class = "chart-description",
+                  paste(
+                    "Use this to inspect the Precision-Recall trade-off, especially when positives are scarce.",
+                    "Precision answers how many selected cases are truly positive; Recall answers how many actual positives are captured.",
+                    "The dashed diagonal is a visual baseline, and the highlighted marker follows the selected threshold."
+                  )
                 )
               )
             )
           ),
-          column(
-            6,
-            div(
-              class = "chart-card",
-              plotlyOutput("pr_plot", height = "330px"),
-              tags$p(
-                class = "chart-description",
-                paste(
-                  "Use this to inspect the Precision-Recall trade-off, especially when positives are scarce.",
-                  "Precision answers how many selected cases are truly positive; Recall answers how many actual positives are captured.",
-                  "The dashed diagonal is a visual baseline, and the highlighted marker follows the selected threshold."
+          uiOutput("binary_extra_plots"),
+          uiOutput("multiclass_extra_plots"),
+          uiOutput("business_validation_insights"),
+          uiOutput("multiclass_business_validation_insights"),
+          fluidRow(
+            column(
+              5,
+              div(
+                class = "chart-card",
+                plotlyOutput("matrix_plot", height = "365px"),
+                tags$p(
+                  class = "chart-description",
+                  paste(
+                    "Use this to see the classification counts at the selected threshold.",
+                    "The diagonal cells are correct predictions; off-diagonal cells are errors and help identify which classes are confused."
+                  )
+                )
+              )
+            ),
+            column(
+              7,
+              div(
+                class = "metrics-card",
+                tags$h3("Performance Metrics"),
+                div(class = "metrics-table", tableOutput("metrics_table")),
+                tags$p(
+                  class = "chart-description",
+                  paste(
+                    "Use these metrics to summarize model quality.",
+                    "Threshold-based metrics such as Accuracy, Precision, Recall, F1 Score, and MCC update with the slider; ROC AUC and PR AUC summarize ranking performance across thresholds."
+                  )
                 )
               )
             )
           )
         ),
-        uiOutput("binary_extra_plots"),
-        uiOutput("multiclass_extra_plots"),
-        uiOutput("business_validation_insights"),
-        uiOutput("multiclass_business_validation_insights"),
-        fluidRow(
-          column(
-            5,
-            div(
-              class = "chart-card",
-              plotlyOutput("matrix_plot", height = "365px"),
-              tags$p(
-                class = "chart-description",
-                paste(
-                  "Use this to see the classification counts at the selected threshold.",
-                  "The diagonal cells are correct predictions; off-diagonal cells are errors and help identify which classes are confused."
-                )
-              )
-            )
-          ),
-          column(
-            7,
-            div(
-              class = "metrics-card",
-              tags$h3("Performance Metrics"),
-              div(class = "metrics-table", tableOutput("metrics_table")),
-              tags$p(
-                class = "chart-description",
-                paste(
-                  "Use these metrics to summarize model quality.",
-                  "Threshold-based metrics such as Accuracy, Precision, Recall, F1 Score, and MCC update with the slider; ROC AUC and PR AUC summarize ranking performance across thresholds."
-                )
-              )
-            )
-          )
+        conditionalPanel(
+          condition = "input.analysis_type == 'regression'",
+          uiOutput("regression_results")
         ),
         tags$details(
           class = "data-details",
           tags$summary("Uploaded Data Preview"),
           div(class = "preview-table", tableOutput("preview_table")),
-          tags$p(
-            class = "chart-description",
-            "Use this table to quickly verify that the uploaded file, Actual Class column, and probability columns were mapped as expected."
+          conditionalPanel(
+            condition = "input.analysis_type == 'classification'",
+            tags$p(
+              class = "chart-description",
+              "Use this table to quickly verify that the uploaded file, Actual Class column, and probability columns were mapped as expected."
+            )
+          ),
+          conditionalPanel(
+            condition = "input.analysis_type == 'regression'",
+            tags$p(
+              class = "chart-description",
+              "Use this table to quickly verify that the uploaded file, Actual / y_true column, and Predicted / y_pred column were mapped as expected."
+            )
           )
         )
       )
@@ -799,6 +1081,7 @@ server <- function(input, output, session) {
   })
 
   output$column_selectors <- renderUI({
+    req(input$analysis_type == "classification")
     req(input$file)
     data <- uploaded_data()
     columns <- names(data)
@@ -855,7 +1138,7 @@ server <- function(input, output, session) {
   })
 
   output$positive_selector <- renderUI({
-    req(input$model_type == "binary", input$truth_col)
+    req(input$analysis_type == "classification", input$model_type == "binary", input$truth_col)
     classes <- uploaded_data() %>%
       pull(all_of(input$truth_col)) %>%
       discard(is.na) %>%
@@ -866,7 +1149,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_score_selectors <- renderUI({
-    req(input$model_type == "multiclass", input$truth_col, input$class_count)
+    req(input$analysis_type == "classification", input$model_type == "multiclass", input$truth_col, input$class_count)
     data <- uploaded_data()
     classes <- data %>%
       pull(all_of(input$truth_col)) %>%
@@ -910,7 +1193,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_focus_controls <- renderUI({
-    req(input$model_type == "multiclass", input$truth_col)
+    req(input$analysis_type == "classification", input$model_type == "multiclass", input$truth_col)
     data <- uploaded_data()
     classes <- data %>%
       pull(all_of(input$truth_col)) %>%
@@ -948,7 +1231,98 @@ server <- function(input, output, session) {
     )
   })
 
+  output$regression_column_selectors <- renderUI({
+    req(input$analysis_type == "regression", input$file)
+    data <- uploaded_data()
+    columns <- names(data)
+    numeric_columns <- data %>%
+      select(where(is.numeric)) %>%
+      names()
+    validate(need(length(numeric_columns) >= 2, "Regression requires at least two numeric columns."))
+
+    suggested_actual <- numeric_columns[
+      str_detect(str_to_lower(numeric_columns), "actual|truth|real|target|y_true|observed")
+    ]
+    actual_selected <- if (!is.null(input$regression_actual_col) &&
+      input$regression_actual_col %in% numeric_columns) {
+      input$regression_actual_col
+    } else {
+      dplyr::first(suggested_actual, default = dplyr::first(numeric_columns, default = ""))
+    }
+
+    predicted_choices <- setdiff(numeric_columns, actual_selected)
+    suggested_predicted <- predicted_choices[
+      str_detect(str_to_lower(predicted_choices), "pred|prediction|score|estimate|y_pred|fitted")
+    ]
+    predicted_selected <- if (!is.null(input$regression_predicted_col) &&
+      input$regression_predicted_col %in% predicted_choices) {
+      input$regression_predicted_col
+    } else {
+      dplyr::first(suggested_predicted, default = dplyr::first(predicted_choices, default = ""))
+    }
+
+    tagList(
+      selectInput(
+        "regression_actual_col",
+        "Actual / y_true column",
+        choices = numeric_columns,
+        selected = actual_selected
+      ),
+      selectInput(
+        "regression_predicted_col",
+        "Predicted / y_pred column",
+        choices = predicted_choices,
+        selected = predicted_selected
+      )
+    )
+  })
+
+  output$regression_tolerance_input <- renderUI({
+    req(input$analysis_type == "regression", input$file)
+    data <- uploaded_data()
+    numeric_columns <- data %>%
+      select(where(is.numeric)) %>%
+      names()
+    req(input$regression_actual_col %in% numeric_columns, input$regression_predicted_col %in% numeric_columns)
+
+    errors <- data %>%
+      transmute(
+        actual = as.numeric(.data[[input$regression_actual_col]]),
+        predicted = as.numeric(.data[[input$regression_predicted_col]])
+      ) %>%
+      drop_na() %>%
+      mutate(absolute_error = abs(predicted - actual)) %>%
+      pull(absolute_error)
+
+    max_error <- if (length(errors) == 0 || all(is.na(errors))) {
+      1
+    } else {
+      max(errors, na.rm = TRUE)
+    }
+    slider_max <- max(1, signif(max_error * 1.1, 3))
+    default_value <- if (length(errors) == 0 || all(is.na(errors))) {
+      0
+    } else {
+      stats::median(errors, na.rm = TRUE)
+    }
+    selected_value <- if (!is.null(input$regression_tolerance)) {
+      pmin(pmax(input$regression_tolerance, 0), slider_max)
+    } else {
+      min(default_value, slider_max)
+    }
+
+    sliderInput(
+      "regression_tolerance",
+      "Absolute error tolerance",
+      min = 0,
+      max = slider_max,
+      value = selected_value,
+      step = slider_max / 100
+    )
+  })
+
   analysis_config <- eventReactive(input$calculate, {
+    req(input$analysis_type == "classification")
     data <- uploaded_data()
     validate(need(input$truth_col %in% names(data), "Select the Actual Class column."))
     truth_raw <- data[[input$truth_col]]
@@ -1021,6 +1395,50 @@ server <- function(input, output, session) {
     }
   })
 
+  regression_config <- eventReactive(input$calculate, {
+    req(input$analysis_type == "regression")
+    data <- uploaded_data()
+    validate(need(input$regression_actual_col %in% names(data), "Select the Actual / y_true column."))
+    validate(need(input$regression_predicted_col %in% names(data), "Select the Predicted / y_pred column."))
+    validate(need(input$regression_actual_col != input$regression_predicted_col, "Actual and Predicted columns must be different."))
+    validate(need(is.numeric(data[[input$regression_actual_col]]), "Actual / y_true column must be numeric."))
+    validate(need(is.numeric(data[[input$regression_predicted_col]]), "Predicted / y_pred column must be numeric."))
+
+    prepared <- data %>%
+      transmute(
+        actual = as.numeric(.data[[input$regression_actual_col]]),
+        predicted = as.numeric(.data[[input$regression_predicted_col]])
+      ) %>%
+      drop_na()
+    validate(need(nrow(prepared) > 0, "No complete numeric rows are available for regression analysis."))
+
+    tolerance <- if (is.null(input$regression_tolerance)) {
+      0
+    } else {
+      as.numeric(input$regression_tolerance)
+    }
+    tolerance <- max(tolerance, 0, na.rm = TRUE)
+    prepared <- regression_add_diagnostics(prepared, tolerance)
+    bins <- if (is.null(input$regression_bins)) 10 else as.integer(input$regression_bins)
+    bins <- min(max(bins, 1), nrow(prepared))
+    log_requested <- isTRUE(input$regression_log_scale)
+    log_available <- regression_log_available(prepared)
+
+    list(
+      type = "regression",
+      data = prepared,
+      omitted = nrow(data) - nrow(prepared),
+      tolerance = tolerance,
+      bins = bins,
+      main_metric = if (is.null(input$regression_main_metric)) "RMSE" else input$regression_main_metric,
+      quantile_sort = if (is.null(input$regression_quantile_sort)) "actual" else input$regression_quantile_sort,
+      show_outliers = isTRUE(input$regression_show_outliers),
+      log_requested = log_requested,
+      log_available = log_available,
+      log_scale = log_requested && log_available
+    )
+  })
+
   analysis_data <- reactive({
     config <- analysis_config()
 
@@ -1075,7 +1493,12 @@ server <- function(input, output, session) {
 
   output$data_notice <- renderUI({
     req(input$calculate > 0)
-    config <- analysis_config()
+    config <- if (input$analysis_type == "regression") {
+      regression_config()
+    } else {
+      analysis_config()
+    }
+
     if (config$omitted == 0) {
       tags$p(class = "notice success", "Data ready for analysis.")
     } else {
@@ -1084,6 +1507,37 @@ server <- function(input, output, session) {
   })
 
   output$summary_cards <- renderUI({
+    req(input$calculate > 0)
+    if (input$analysis_type == "regression") {
+      config <- regression_config()
+      metrics <- regression_metric_values(config$data, config$tolerance) %>%
+        mutate(
+          Label = recode(
+            Metric,
+            `Median Absolute Error` = "MedAE",
+            `Pearson Correlation` = "Pearson Corr.",
+            `Spearman Correlation` = "Spearman Corr.",
+            `% Within Tolerance` = "Within Tolerance",
+            .default = Metric
+          ),
+          Display = case_when(
+            Metric %in% c("WAPE", "MAPE", "sMAPE", "% Within Tolerance") ~ format_percent_metric(Value),
+            TRUE ~ format_metric(Value)
+          )
+        )
+
+      return(
+        div(
+          class = "cards",
+          map2(metrics$Label, metrics$Display, ~ div(
+            class = "kpi-card",
+            tags$p(.x),
+            tags$strong(.y)
+          ))
+        )
+      )
+    }
+
     config <- analysis_config()
     data <- analysis_data()
     accuracy <- metric_value(accuracy_vec, data$truth, data$estimate)
@@ -1136,6 +1590,7 @@ server <- function(input, output, session) {
   })
 
   output$binary_extra_plots <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     if (config$type != "binary") {
       return(NULL)
@@ -1179,6 +1634,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_extra_plots <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     if (config$type != "multiclass") {
       return(NULL)
@@ -1288,6 +1744,7 @@ server <- function(input, output, session) {
   })
 
   output$business_validation_insights <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     if (config$type != "binary") {
       return(NULL)
@@ -1403,6 +1860,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_business_validation_insights <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     if (config$type != "multiclass") {
       return(NULL)
@@ -1512,7 +1970,162 @@ server <- function(input, output, session) {
     )
   })
 
+  output$regression_results <- renderUI({
+    req(input$analysis_type == "regression")
+    config <- regression_config()
+
+    tagList(
+      uiOutput("regression_log_notice"),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Actual vs Predicted"),
+            plotlyOutput("regression_actual_predicted_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare predicted values against actual values.",
+                "The diagonal line is perfect prediction; points near the line are better, and the color shows whether absolute error is within the selected tolerance."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Residual Plot"),
+            plotlyOutput("regression_residual_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to inspect residuals, where error equals predicted minus actual.",
+                "A healthy model usually has residuals centered around zero without strong patterns across predicted values."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Residual Distribution"),
+            plotlyOutput("regression_residual_distribution_plot", height = "320px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this histogram to see whether residuals are centered and symmetric.",
+                "Bias is the mean residual; values above zero mean overprediction on average, while values below zero mean underprediction."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Error CDF / Tolerance Curve"),
+            plotlyOutput("regression_error_cdf_plot", height = "320px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to understand what share of observations falls below any absolute-error level.",
+                "The vertical line is the selected tolerance; the intersection shows the percentage within tolerance."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Regression Calibration Plot"),
+            plotlyOutput("regression_calibration_plot", height = "330px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare average prediction and average actual value by prediction bins.",
+                "If the model is calibrated, bin points should follow the diagonal; systematic gaps reveal overprediction or underprediction."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Absolute Error vs Actual"),
+            plotlyOutput("regression_absolute_error_plot", height = "330px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to see whether errors grow with the size of the actual value.",
+                "Outlier highlighting helps identify observations with unusually large absolute error."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          6,
+          div(
+            class = "chart-card chart-card--titled",
+            tags$h4(class = "chart-title", "Quantile Performance"),
+            plotlyOutput("regression_quantile_plot", height = "340px"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this to compare performance across ordered value segments.",
+                "Quantiles are sorted by Actual or Predicted values, and the selected Main metric controls the bar height."
+              )
+            )
+          )
+        ),
+        column(
+          6,
+          div(
+            class = "metrics-card insights-table-card",
+            tags$h4(class = "chart-title", "Quantile Summary"),
+            DT::DTOutput("regression_quantile_table"),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "Use this table to audit n, mean actual, mean predicted, MAE, RMSE, Bias, WAPE, and MAPE by quantile.",
+                "MAE is average absolute error, RMSE penalizes large errors more, and WAPE/MAPE express error relative to actual values."
+              )
+            )
+          )
+        )
+      ),
+      fluidRow(
+        column(
+          12,
+          div(
+            class = "metrics-card",
+            tags$h3("Regression Metrics"),
+            div(class = "metrics-table", tableOutput("regression_metrics_table")),
+            tags$p(
+              class = "chart-description",
+              paste(
+                "MAE and Median Absolute Error summarize typical error magnitude; RMSE emphasizes large misses.",
+                "R2 measures explained variance, correlations measure association, WAPE/MAPE are scale-relative errors, and Within Tolerance uses the selected absolute-error tolerance."
+              )
+            )
+          )
+        )
+      )
+    )
+  })
+
   output$roc_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     data <- analysis_data()
     classes <- if (config$type == "binary") config$classes[[1]] else config$classes
@@ -1578,6 +2191,7 @@ server <- function(input, output, session) {
   })
 
   output$pr_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     data <- analysis_data()
     classes <- if (config$type == "binary") config$classes[[1]] else config$classes
@@ -1643,6 +2257,7 @@ server <- function(input, output, session) {
   })
 
   output$probability_distribution_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data() %>%
@@ -1693,6 +2308,7 @@ server <- function(input, output, session) {
   })
 
   output$calibration_probability_bin_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     confidence_level_percent <- if (is.null(input$confidence_level)) {
@@ -1776,6 +2392,7 @@ server <- function(input, output, session) {
   })
 
   output$cumulative_gains_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data()
@@ -1810,6 +2427,7 @@ server <- function(input, output, session) {
   })
 
   output$lift_curve_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data()
@@ -1844,6 +2462,7 @@ server <- function(input, output, session) {
   })
 
   output$ks_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data()
@@ -1897,6 +2516,7 @@ server <- function(input, output, session) {
   })
 
   output$decile_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     deciles <- decile_analysis_table(analysis_data(), input$threshold)
@@ -1929,6 +2549,7 @@ server <- function(input, output, session) {
   })
 
   output$decile_table <- DT::renderDT({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     deciles <- decile_analysis_table(analysis_data(), input$threshold)
@@ -1960,6 +2581,7 @@ server <- function(input, output, session) {
   })
 
   output$calibration_summary <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     div(
@@ -1970,6 +2592,7 @@ server <- function(input, output, session) {
   })
 
   output$mcc_threshold_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data()
@@ -2020,6 +2643,7 @@ server <- function(input, output, session) {
   })
 
   output$mcc_summary <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "binary")
     data <- analysis_data()
@@ -2050,6 +2674,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_metric_overview_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     metric_data <- multiclass_metric_values(analysis_data(), config$classes) %>%
@@ -2085,6 +2710,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_probability_heatmap_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     heatmap_data <- multiclass_probability_heatmap_table(analysis_data(), config$classes)
@@ -2118,6 +2744,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_class_volume_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- analysis_data()
@@ -2164,6 +2791,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_confidence_distribution_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     confidence_data <- multiclass_confidence_table(analysis_data(), config$classes)
@@ -2194,6 +2822,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_probability_distribution_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     focus_class <- selected_multiclass_class()
@@ -2242,6 +2871,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_calibration_summary <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     div(
@@ -2252,6 +2882,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_calibration_probability_bin_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     focus_class <- selected_multiclass_class()
@@ -2332,6 +2963,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_cumulative_gains_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- analysis_data()
@@ -2383,6 +3015,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_lift_curve_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- analysis_data()
@@ -2435,6 +3068,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_decile_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     deciles <- decile_analysis_table(selected_multiclass_data(), selected_multiclass_threshold())
@@ -2467,6 +3101,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_decile_table <- DT::renderDT({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     deciles <- decile_analysis_table(selected_multiclass_data(), selected_multiclass_threshold())
@@ -2498,6 +3133,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_ks_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- selected_multiclass_data()
@@ -2551,6 +3187,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_mcc_threshold_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- selected_multiclass_data()
@@ -2603,6 +3240,7 @@ server <- function(input, output, session) {
   })
 
   output$multiclass_mcc_summary <- renderUI({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     req(config$type == "multiclass")
     data <- selected_multiclass_data()
@@ -2633,12 +3271,377 @@ server <- function(input, output, session) {
     )
   })
 
+  regression_plot_data <- reactive({
+    config <- regression_config()
+    config$data %>%
+      mutate(
+        PointStatus = case_when(
+          config$show_outliers & is_outlier ~ "Outlier",
+          within_tolerance ~ "Within Tolerance",
+          TRUE ~ "Outside Tolerance"
+        ),
+        PointStatus = factor(PointStatus, levels = c("Within Tolerance", "Outside Tolerance", "Outlier"))
+      )
+  })
+
+  output$regression_log_notice <- renderUI({
+    config <- regression_config()
+    if (config$log_requested && !config$log_available) {
+      tags$p(
+        class = "notice",
+        "Log scale was requested but ignored because Actual or Predicted contains values less than or equal to zero."
+      )
+    } else {
+      NULL
+    }
+  })
+
+  output$regression_actual_predicted_plot <- renderPlotly({
+    config <- regression_config()
+    data <- regression_plot_data()
+    range_values <- regression_range(data)
+    line_values <- if (config$log_scale) {
+      positive_values <- c(data$actual, data$predicted)
+      positive_values <- positive_values[positive_values > 0]
+      range(positive_values, na.rm = TRUE)
+    } else {
+      range_values
+    }
+    axis_type <- if (config$log_scale) "log" else "linear"
+
+    plot_ly() %>%
+      add_trace(
+        data = data,
+        x = ~actual,
+        y = ~predicted,
+        color = ~PointStatus,
+        colors = c(
+          "Within Tolerance" = theme_colors$bright_blue,
+          "Outside Tolerance" = "#F7893B",
+          "Outlier" = "#C43131"
+        ),
+        type = "scatter",
+        mode = "markers",
+        text = ~Tooltip,
+        hoverinfo = "text",
+        marker = list(size = 7, opacity = 0.72)
+      ) %>%
+      add_trace(
+        x = line_values,
+        y = line_values,
+        type = "scatter",
+        mode = "lines",
+        name = "Perfect Prediction",
+        hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash", width = 2),
+        inherit = FALSE
+      ) %>%
+      layout(
+        xaxis = list(title = "Actual", type = axis_type, range = if (config$log_scale) NULL else range_values),
+        yaxis = list(title = "Predicted", type = axis_type, range = if (config$log_scale) NULL else range_values),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_residual_plot <- renderPlotly({
+    config <- regression_config()
+    data <- regression_plot_data()
+    xaxis <- list(title = "Predicted", type = if (config$log_scale) "log" else "linear")
+
+    plot_ly() %>%
+      add_trace(
+        data = data,
+        x = ~predicted,
+        y = ~error,
+        color = ~PointStatus,
+        colors = c(
+          "Within Tolerance" = theme_colors$bright_blue,
+          "Outside Tolerance" = "#F7893B",
+          "Outlier" = "#C43131"
+        ),
+        type = "scatter",
+        mode = "markers",
+        text = ~Tooltip,
+        hoverinfo = "text",
+        marker = list(size = 7, opacity = 0.72)
+      ) %>%
+      add_trace(
+        x = range(data$predicted, na.rm = TRUE),
+        y = c(0, 0),
+        type = "scatter",
+        mode = "lines",
+        name = "Zero Error",
+        hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash", width = 2),
+        inherit = FALSE
+      ) %>%
+      layout(
+        xaxis = xaxis,
+        yaxis = list(title = "Residual (Predicted - Actual)", zeroline = TRUE),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_residual_distribution_plot <- renderPlotly({
+    data <- regression_config()$data
+    residual_mean <- mean(data$error, na.rm = TRUE)
+    residual_median <- median(data$error, na.rm = TRUE)
+    x_range <- range(data$error, na.rm = TRUE)
+
+    plot_ly() %>%
+      add_histogram(
+        data = data,
+        x = ~error,
+        name = "Residuals",
+        marker = list(color = theme_colors$bright_blue, line = list(color = "white", width = 1)),
+        opacity = 0.72,
+        nbinsx = 35,
+        hovertemplate = "Residual bin: %{x}<br>Count: %{y}<extra></extra>"
+      ) %>%
+      add_trace(
+        x = c(0, 0),
+        y = c(0, 1),
+        yaxis = "y2",
+        type = "scatter",
+        mode = "lines",
+        name = "Zero Error",
+        hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash", width = 2)
+      ) %>%
+      add_trace(
+        x = c(residual_mean, residual_mean),
+        y = c(0, 1),
+        yaxis = "y2",
+        type = "scatter",
+        mode = "lines",
+        name = "Mean Error",
+        hovertemplate = paste0("Mean Error: ", scales::number(residual_mean, accuracy = 0.001), "<extra></extra>"),
+        line = list(color = "#F7893B", width = 2)
+      ) %>%
+      add_trace(
+        x = c(residual_median, residual_median),
+        y = c(0, 1),
+        yaxis = "y2",
+        type = "scatter",
+        mode = "lines",
+        name = "Median Error",
+        hovertemplate = paste0("Median Error: ", scales::number(residual_median, accuracy = 0.001), "<extra></extra>"),
+        line = list(color = theme_colors$navy, width = 2, dash = "dot")
+      ) %>%
+      layout(
+        xaxis = list(title = "Residual", range = x_range),
+        yaxis = list(title = "Count"),
+        yaxis2 = list(overlaying = "y", side = "right", visible = FALSE, range = c(0, 1)),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20),
+        barmode = "overlay"
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_error_cdf_plot <- renderPlotly({
+    config <- regression_config()
+    cdf_data <- regression_error_cdf_table(config$data)
+    within_share <- mean(config$data$within_tolerance, na.rm = TRUE)
+
+    plot_ly() %>%
+      add_trace(
+        data = cdf_data,
+        x = ~absolute_error,
+        y = ~cumulative_share,
+        text = ~Tooltip,
+        type = "scatter",
+        mode = "lines",
+        name = "Error CDF",
+        hoverinfo = "text",
+        line = list(color = theme_colors$bright_blue, width = 2.3)
+      ) %>%
+      add_trace(
+        x = c(config$tolerance, config$tolerance),
+        y = c(0, within_share),
+        type = "scatter",
+        mode = "lines",
+        name = "Selected Tolerance",
+        hovertemplate = paste0(
+          "Tolerance: ", scales::number(config$tolerance, accuracy = 0.001),
+          "<br>Within Tolerance: ", scales::percent(within_share, accuracy = 0.1),
+          "<extra></extra>"
+        ),
+        line = list(color = "#F7893B", dash = "dash", width = 2)
+      ) %>%
+      layout(
+        xaxis = list(title = "Absolute Error", rangemode = "tozero"),
+        yaxis = list(title = "Cumulative Share", range = c(0, 1), tickformat = ".0%"),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_calibration_plot <- renderPlotly({
+    config <- regression_config()
+    data <- regression_calibration_table(config$data, config$bins)
+    range_values <- regression_range(tibble(actual = data$`Mean Actual`, predicted = data$`Mean Predicted`))
+    line_values <- if (config$log_scale) {
+      positive_values <- c(data$`Mean Actual`, data$`Mean Predicted`)
+      positive_values <- positive_values[positive_values > 0]
+      range(positive_values, na.rm = TRUE)
+    } else {
+      range_values
+    }
+    axis_type <- if (config$log_scale) "log" else "linear"
+
+    plot_ly() %>%
+      add_trace(
+        data = data,
+        x = ~`Mean Predicted`,
+        y = ~`Mean Actual`,
+        text = ~Tooltip,
+        type = "scatter",
+        mode = "lines+markers",
+        name = "Calibration",
+        hoverinfo = "text",
+        line = list(color = theme_colors$bright_blue, width = 2.3),
+        marker = list(color = theme_colors$bright_blue, size = 8)
+      ) %>%
+      add_trace(
+        x = line_values,
+        y = line_values,
+        type = "scatter",
+        mode = "lines",
+        name = "Perfect Calibration",
+        hoverinfo = "skip",
+        line = list(color = "#D3DCE6", dash = "dash", width = 2),
+        inherit = FALSE
+      ) %>%
+      layout(
+        xaxis = list(title = "Mean Predicted", type = axis_type, range = if (config$log_scale) NULL else range_values),
+        yaxis = list(title = "Mean Actual", type = axis_type, range = if (config$log_scale) NULL else range_values),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_quantile_plot <- renderPlotly({
+    config <- regression_config()
+    quantiles <- regression_quantile_table(config$data, config$bins, config$quantile_sort)
+    metric_column <- regression_metric_column(config$main_metric)
+    if (!metric_column %in% names(quantiles)) {
+      metric_column <- "RMSE"
+    }
+    metric_values <- quantiles[[metric_column]]
+    is_percent_metric <- metric_column %in% c("WAPE", "MAPE", "sMAPE")
+    quantiles <- quantiles %>%
+      mutate(
+        SelectedMetric = metric_values,
+        Tooltip = paste0(
+          Tooltip,
+          "<br>Selected Metric (", metric_column, "): ",
+          if (is_percent_metric) {
+            scales::percent(SelectedMetric, accuracy = 0.1)
+          } else {
+            scales::number(SelectedMetric, accuracy = 0.001)
+          }
+        )
+      )
+
+    plot_ly(
+      quantiles,
+      x = ~factor(Quantile),
+      y = ~SelectedMetric,
+      customdata = ~Tooltip,
+      hovertemplate = "%{customdata}<extra></extra>",
+      type = "bar",
+      name = metric_column,
+      marker = list(color = theme_colors$bright_blue, opacity = 0.78)
+    ) %>%
+      layout(
+        xaxis = list(title = paste("Quantile sorted by", str_to_title(config$quantile_sort))),
+        yaxis = list(
+          title = metric_column,
+          tickformat = if (is_percent_metric) ".0%" else NULL,
+          rangemode = "tozero"
+        ),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_absolute_error_plot <- renderPlotly({
+    config <- regression_config()
+    data <- regression_plot_data()
+    xaxis <- list(title = "Actual", type = if (config$log_scale) "log" else "linear")
+
+    plot_ly(
+      data,
+      x = ~actual,
+      y = ~absolute_error,
+      color = ~PointStatus,
+      colors = c(
+        "Within Tolerance" = theme_colors$bright_blue,
+        "Outside Tolerance" = "#F7893B",
+        "Outlier" = "#C43131"
+      ),
+      type = "scatter",
+      mode = "markers",
+      text = ~Tooltip,
+      hoverinfo = "text",
+      marker = list(size = 7, opacity = 0.72)
+    ) %>%
+      layout(
+        xaxis = xaxis,
+        yaxis = list(title = "Absolute Error", rangemode = "tozero"),
+        legend = list(orientation = "h", x = 0, y = -0.22),
+        margin = list(t = 28, b = 78, l = 64, r = 20)
+      ) %>%
+      config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
+  })
+
+  output$regression_metrics_table <- renderTable({
+    config <- regression_config()
+    regression_metric_table(config$data, config$tolerance)
+  }, striped = TRUE, bordered = FALSE, spacing = "m", align = "l")
+
+  output$regression_quantile_table <- DT::renderDT({
+    config <- regression_config()
+    display <- regression_quantile_table(config$data, config$bins, config$quantile_sort) %>%
+      select(
+        Quantile,
+        Observations,
+        `Mean Actual`,
+        `Mean Predicted`,
+        MAE,
+        RMSE,
+        MedAE,
+        Bias,
+        R2,
+        WAPE,
+        MAPE,
+        sMAPE
+      )
+
+    DT::datatable(
+      display,
+      rownames = FALSE,
+      options = list(dom = "t", pageLength = nrow(display), scrollX = TRUE)
+    ) %>%
+      DT::formatRound(c("Mean Actual", "Mean Predicted", "MAE", "RMSE", "MedAE", "Bias", "R2"), digits = 3) %>%
+      DT::formatPercentage(c("WAPE", "MAPE", "sMAPE"), digits = 1)
+  })
+
   output$matrix_plot <- renderPlotly({
+    req(input$analysis_type == "classification")
     suppressWarnings(ggplotly(confusion_plot(analysis_data()), tooltip = "text")) %>%
       config(displaylogo = FALSE, modeBarButtonsToRemove = c("select2d", "lasso2d"))
   })
 
   output$metrics_table <- renderTable({
+    req(input$analysis_type == "classification")
     config <- analysis_config()
     data <- analysis_data()
 
