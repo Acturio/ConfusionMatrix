@@ -429,6 +429,61 @@ body {
   margin-bottom: 12px;
 }
 
+.ai-controls {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 16px;
+}
+
+.ai-controls h3 {
+  color: var(--navy);
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 12px;
+}
+
+.ai-report-empty,
+.ai-report-body {
+  background: #fff;
+  border: 1px solid #edf2f6;
+  border-radius: 8px;
+  color: var(--text);
+  line-height: 1.55;
+  margin-top: 14px;
+  min-height: 360px;
+  padding: 22px 24px;
+}
+
+.ai-report-empty h3,
+.ai-report-body h1,
+.ai-report-body h2 {
+  color: var(--navy);
+  font-weight: 600;
+}
+
+.ai-report-body h1 {
+  border-bottom: 1px solid var(--line);
+  font-size: 24px;
+  margin: 0 0 18px;
+  padding-bottom: 12px;
+}
+
+.ai-report-body h2 {
+  color: var(--blue);
+  font-size: 18px;
+  margin: 22px 0 8px;
+}
+
+.ai-report-body p,
+.ai-report-body li {
+  font-size: 14px;
+}
+
+.ai-report-body ul,
+.ai-report-body ol {
+  padding-left: 22px;
+}
+
 @media (max-width: 990px) {
   body {
     overflow: auto;

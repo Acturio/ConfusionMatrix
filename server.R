@@ -1,1070 +1,8 @@
-library(shiny)
-library(tidyverse)
-library(yardstick)
-library(plotly)
-
-theme_colors <- list(
-  navy = "#072146",
-  blue = "#004481",
-  bright_blue = "#1973B8",
-  sky = "#49A5E6",
-  aqua = "#2DCCCD",
-  light = "#F4F7F8"
-)
-
-metric_value <- function(metric, truth, estimate = NULL, ...) {
-  value <- if (is.null(estimate)) {
-    metric(truth = truth, ...)
-  } else {
-    metric(truth = truth, estimate = estimate, ...)
-  }
-
-  as.numeric(value)
-}
-
-format_metric <- function(x) {
-  if_else(is.na(x), "-", scales::number(x, accuracy = 0.001))
-}
-
-continuous_x_axis <- function(title, percent = FALSE) {
-  axis <- list(
-    title = title,
-    range = c(0, 1),
-    tick0 = 0,
-    dtick = 0.1
-  )
-
-  if (percent) {
-    axis$tickformat <- ".0%"
-  }
-
-  axis
-}
-
-safe_mean <- function(x) {
-  if (length(x) == 0 || all(is.na(x))) {
-    return(NA_real_)
-  }
-
-  mean(x, na.rm = TRUE)
-}
-
-safe_median <- function(x) {
-  if (length(x) == 0 || all(is.na(x))) {
-    return(NA_real_)
-  }
-
-  median(x, na.rm = TRUE)
-}
-
-safe_correlation <- function(x, y, method = "pearson") {
-  complete <- complete.cases(x, y)
-  x <- x[complete]
-  y <- y[complete]
-
-  if (length(x) < 3 || stats::sd(x) == 0 || stats::sd(y) == 0) {
-    return(NA_real_)
-  }
-
-  suppressWarnings(stats::cor(x, y, method = method))
-}
-
-format_percent_metric <- function(x) {
-  if_else(is.na(x), "-", scales::percent(x, accuracy = 0.1))
-}
-
-regression_range <- function(data) {
-  values <- c(data$actual, data$predicted)
-  values <- values[is.finite(values)]
-
-  if (length(values) == 0) {
-    return(c(0, 1))
-  }
-
-  range_values <- range(values, na.rm = TRUE)
-  padding <- diff(range_values) * 0.05
-  if (is.na(padding) || padding == 0) {
-    padding <- max(abs(range_values), 1) * 0.05
-  }
-
-  range_values + c(-padding, padding)
-}
-
-regression_log_available <- function(data) {
-  all(data$actual > 0, data$predicted > 0, na.rm = TRUE)
-}
-
-regression_outlier_limit <- function(absolute_error) {
-  absolute_error <- absolute_error[is.finite(absolute_error)]
-
-  if (length(absolute_error) < 4) {
-    return(Inf)
-  }
-
-  q1 <- stats::quantile(absolute_error, 0.25, na.rm = TRUE, names = FALSE)
-  q3 <- stats::quantile(absolute_error, 0.75, na.rm = TRUE, names = FALSE)
-  iqr <- q3 - q1
-
-  if (is.na(iqr) || iqr == 0) {
-    return(Inf)
-  }
-
-  q3 + 1.5 * iqr
-}
-
-regression_add_diagnostics <- function(data, tolerance = 0) {
-  outlier_limit <- regression_outlier_limit(abs(data$predicted - data$actual))
-
-  data %>%
-    mutate(
-      error = predicted - actual,
-      absolute_error = abs(error),
-      percentage_error = if_else(actual == 0, NA_real_, error / actual),
-      APE = abs(percentage_error),
-      sAPE = if_else(
-        abs(actual) + abs(predicted) == 0,
-        NA_real_,
-        2 * absolute_error / (abs(actual) + abs(predicted))
-      ),
-      within_tolerance = absolute_error <= tolerance,
-      is_outlier = absolute_error > outlier_limit,
-      Tooltip = paste0(
-        "<b>Regression Prediction</b>",
-        "<br>Actual: ", scales::number(actual, accuracy = 0.001),
-        "<br>Predicted: ", scales::number(predicted, accuracy = 0.001),
-        "<br>Error: ", scales::number(error, accuracy = 0.001),
-        "<br>Absolute Error: ", scales::number(absolute_error, accuracy = 0.001)
-      )
-    )
-}
-
-regression_metric_values <- function(data, tolerance = 0) {
-  total_ss <- sum((data$actual - mean(data$actual, na.rm = TRUE))^2, na.rm = TRUE)
-  residual_ss <- sum((data$actual - data$predicted)^2, na.rm = TRUE)
-  absolute_actual_sum <- sum(abs(data$actual), na.rm = TRUE)
-
-  tibble(
-    Metric = c(
-      "MAE", "RMSE", "Median Absolute Error", "Bias",
-      "R2", "Pearson Correlation", "Spearman Correlation",
-      "WAPE", "MAPE", "sMAPE", "% Within Tolerance"
-    ),
-    Value = c(
-      safe_mean(data$absolute_error),
-      sqrt(safe_mean(data$error^2)),
-      safe_median(data$absolute_error),
-      safe_mean(data$error),
-      if_else(total_ss == 0, NA_real_, 1 - residual_ss / total_ss),
-      safe_correlation(data$actual, data$predicted, method = "pearson"),
-      safe_correlation(data$actual, data$predicted, method = "spearman"),
-      if_else(absolute_actual_sum == 0, NA_real_, sum(data$absolute_error, na.rm = TRUE) / absolute_actual_sum),
-      safe_mean(data$APE),
-      safe_mean(data$sAPE),
-      safe_mean(data$within_tolerance)
-    )
-  )
-}
-
-regression_metric_table <- function(data, tolerance = 0) {
-  regression_metric_values(data, tolerance) %>%
-    mutate(
-      Value = case_when(
-        Metric %in% c("WAPE", "MAPE", "sMAPE", "% Within Tolerance") ~ format_percent_metric(Value),
-        TRUE ~ format_metric(Value)
-      )
-    )
-}
-
-regression_error_cdf_table <- function(data) {
-  data %>%
-    filter(!is.na(absolute_error)) %>%
-    arrange(absolute_error) %>%
-    mutate(
-      cumulative_share = row_number() / n(),
-      Tooltip = paste0(
-        "<b>Absolute Error: ", scales::number(absolute_error, accuracy = 0.001), "</b>",
-        "<br>Cumulative Share: ", scales::percent(cumulative_share, accuracy = 0.1)
-      )
-    )
-}
-
-regression_calibration_table <- function(data, bins = 10) {
-  bin_count <- min(max(as.integer(bins), 1), nrow(data))
-  if (bin_count < 1) {
-    return(tibble())
-  }
-
-  data %>%
-    arrange(predicted) %>%
-    mutate(bin = pmin(bin_count, ceiling(row_number() * bin_count / n()))) %>%
-    group_by(bin) %>%
-    summarise(
-      Observations = n(),
-      `Mean Predicted` = mean(predicted),
-      `Mean Actual` = mean(actual),
-      `Mean Error` = mean(error),
-      .groups = "drop"
-    ) %>%
-    mutate(
-      Tooltip = paste0(
-        "<b>Bin: ", bin, "</b>",
-        "<br>Observations: ", Observations,
-        "<br>Mean Prediction: ", scales::number(`Mean Predicted`, accuracy = 0.001),
-        "<br>Mean Actual: ", scales::number(`Mean Actual`, accuracy = 0.001),
-        "<br>Mean Error: ", scales::number(`Mean Error`, accuracy = 0.001)
-      )
-    )
-}
-
-regression_quantile_table <- function(data, bins = 10, sort_by = "actual") {
-  bin_count <- min(max(as.integer(bins), 1), nrow(data))
-  sort_column <- if_else(sort_by == "predicted", "predicted", "actual")
-
-  if (bin_count < 1) {
-    return(tibble())
-  }
-
-  data %>%
-    arrange(.data[[sort_column]]) %>%
-    mutate(Quantile = pmin(bin_count, ceiling(row_number() * bin_count / n()))) %>%
-    group_by(Quantile) %>%
-    summarise(
-      Observations = n(),
-      `Mean Actual` = mean(actual),
-      `Mean Predicted` = mean(predicted),
-      MAE = mean(absolute_error),
-      RMSE = sqrt(mean(error^2)),
-      MedAE = median(absolute_error),
-      Bias = mean(error),
-      R2 = {
-        total_ss <- sum((actual - mean(actual))^2)
-        residual_ss <- sum((actual - predicted)^2)
-        if (total_ss == 0) NA_real_ else 1 - residual_ss / total_ss
-      },
-      WAPE = if_else(sum(abs(actual)) == 0, NA_real_, sum(absolute_error) / sum(abs(actual))),
-      MAPE = safe_mean(APE),
-      sMAPE = safe_mean(sAPE),
-      .groups = "drop"
-    ) %>%
-    mutate(
-      Tooltip = paste0(
-        "<b>Quantile: ", Quantile, "</b>",
-        "<br>Observations: ", Observations,
-        "<br>Mean Actual: ", scales::number(`Mean Actual`, accuracy = 0.001),
-        "<br>Mean Predicted: ", scales::number(`Mean Predicted`, accuracy = 0.001),
-        "<br>MAE: ", scales::number(MAE, accuracy = 0.001),
-        "<br>RMSE: ", scales::number(RMSE, accuracy = 0.001),
-        "<br>Bias: ", scales::number(Bias, accuracy = 0.001),
-        "<br>R2: ", scales::number(R2, accuracy = 0.001),
-        "<br>WAPE: ", scales::percent(WAPE, accuracy = 0.1),
-        "<br>MAPE: ", scales::percent(MAPE, accuracy = 0.1)
-      )
-    )
-}
-
-regression_metric_column <- function(metric) {
-  recode(
-    metric,
-    "Median Absolute Error" = "MedAE",
-    "MedAE" = "MedAE",
-    .default = metric
-  )
-}
-
-binary_metric_table <- function(data) {
-  tibble(
-    Metric = c(
-      "Accuracy", "Sensitivity", "Specificity", "Precision",
-      "Recall", "F1 Score", "MCC", "ROC AUC", "PR AUC"
-    ),
-    Value = c(
-      metric_value(accuracy_vec, data$truth, data$estimate),
-      metric_value(sens_vec, data$truth, data$estimate, event_level = "first"),
-      metric_value(spec_vec, data$truth, data$estimate, event_level = "first"),
-      metric_value(ppv_vec, data$truth, data$estimate, event_level = "first"),
-      metric_value(recall_vec, data$truth, data$estimate, event_level = "first"),
-      metric_value(f_meas_vec, data$truth, data$estimate, event_level = "first"),
-      mcc_value(data),
-      metric_value(roc_auc_vec, data$truth, data$score, event_level = "first"),
-      metric_value(pr_auc_vec, data$truth, data$score, event_level = "first")
-    )
-  ) %>%
-    mutate(Value = format_metric(Value))
-}
-
-one_vs_rest_data <- function(data, class_name, score) {
-  data %>%
-    transmute(
-      truth = factor(if_else(truth == class_name, class_name, "Rest"),
-        levels = c(class_name, "Rest")
-      ),
-      estimate = factor(if_else(estimate == class_name, class_name, "Rest"),
-        levels = c(class_name, "Rest")
-      ),
-      score = score
-    )
-}
-
-multiclass_focus_class <- function(config, selected_class = NULL) {
-  if (!is.null(selected_class) && selected_class %in% config$classes) {
-    return(selected_class)
-  }
-
-  config$classes[[1]]
-}
-
-multiclass_focus_data <- function(config, selected_class = NULL, threshold = NULL) {
-  class_name <- multiclass_focus_class(config, selected_class)
-  score <- as.numeric(config$data[[class_name]])
-  predicted_focus <- if (is.null(threshold)) {
-    config$data$estimate == class_name
-  } else {
-    score >= threshold
-  }
-
-  config$data %>%
-    transmute(
-      truth = factor(if_else(truth == class_name, class_name, "Rest"),
-        levels = c(class_name, "Rest")
-      ),
-      estimate = factor(if_else(predicted_focus, class_name, "Rest"),
-        levels = c(class_name, "Rest")
-      ),
-      score = score
-    )
-}
-
-multiclass_lift_gains_table <- function(data, classes) {
-  map_dfr(classes, function(class_name) {
-    one_vs_rest_data(data, class_name, data[[class_name]]) %>%
-      lift_gains_table() %>%
-      mutate(Class = class_name)
-  })
-}
-
-multiclass_probability_heatmap_table <- function(data, classes) {
-  data %>%
-    select(truth, all_of(classes)) %>%
-    group_by(`Actual Class` = truth) %>%
-    summarise(across(all_of(classes), mean), .groups = "drop") %>%
-    pivot_longer(
-      cols = all_of(classes),
-      names_to = "Probability Class",
-      values_to = "Mean Probability"
-    ) %>%
-    mutate(
-      Tooltip = paste0(
-        "<b>Actual Class: ", `Actual Class`, "</b>",
-        "<br>Probability Class: ", `Probability Class`,
-        "<br>Mean Probability: ", scales::percent(`Mean Probability`, accuracy = 0.1)
-      )
-    )
-}
-
-multiclass_confidence_table <- function(data, classes) {
-  max_probability <- do.call(pmax, c(as.list(data[classes]), list(na.rm = TRUE)))
-
-  data %>%
-    mutate(
-      `Max Probability` = max_probability,
-      Result = if_else(truth == estimate, "Correct", "Incorrect"),
-      Tooltip = paste0(
-        "<b>Prediction Result: ", Result, "</b>",
-        "<br>Actual Class: ", truth,
-        "<br>Predicted Class: ", estimate,
-        "<br>Max Probability: ", scales::percent(`Max Probability`, accuracy = 0.1)
-      )
-    )
-}
-
-multiclass_metric_values <- function(data, classes) {
-  map_dfr(classes, function(class_name) {
-    class_data <- one_vs_rest_data(data, class_name, data[[class_name]])
-
-    tibble(
-      Class = class_name,
-      Sensitivity = metric_value(sens_vec, class_data$truth, class_data$estimate,
-        event_level = "first"
-      ),
-      Specificity = metric_value(spec_vec, class_data$truth, class_data$estimate,
-        event_level = "first"
-      ),
-      Precision = metric_value(ppv_vec, class_data$truth, class_data$estimate,
-        event_level = "first"
-      ),
-      `F1 Score` = metric_value(f_meas_vec, class_data$truth, class_data$estimate,
-        event_level = "first"
-      ),
-      `ROC AUC` = metric_value(roc_auc_vec, class_data$truth, class_data$score,
-        event_level = "first"
-      ),
-      `PR AUC` = metric_value(pr_auc_vec, class_data$truth, class_data$score,
-        event_level = "first"
-      )
-    )
-  })
-}
-
-multiclass_metric_table <- function(data, classes) {
-  multiclass_metric_values(data, classes) %>%
-    mutate(across(-Class, format_metric))
-}
-
-curve_data <- function(data, classes, curve_function) {
-  map_dfr(classes, function(class_name) {
-    class_data <- one_vs_rest_data(data, class_name, data[[class_name]])
-    curve_function(class_data, truth, score, event_level = "first") %>%
-      mutate(Class = class_name)
-  })
-}
-
-curve_colors <- function(classes) {
-  set_names(
-    rep(c(theme_colors$bright_blue, theme_colors$aqua, "#F7893B", "#7C53A5", "#5BBF7A"),
-      length.out = length(classes)
-    ),
-    classes
-  )
-}
-
-binary_current_tooltip <- function(data, threshold) {
-  metrics <- binary_metric_table(data) %>%
-    deframe()
-
-  paste0(
-    "<b>Selected Threshold: ", scales::number(threshold, accuracy = 0.001), "</b>",
-    "<br>Accuracy: ", metrics[["Accuracy"]],
-    "<br>Sensitivity: ", metrics[["Sensitivity"]],
-    "<br>Specificity: ", metrics[["Specificity"]],
-    "<br>Precision: ", metrics[["Precision"]],
-    "<br>Recall: ", metrics[["Recall"]],
-    "<br>F1 Score: ", metrics[["F1 Score"]],
-    "<br>MCC: ", metrics[["MCC"]],
-    "<br>ROC AUC: ", metrics[["ROC AUC"]],
-    "<br>PR AUC: ", metrics[["PR AUC"]]
-  )
-}
-
-binomial_confidence_interval <- function(positive_count, total_count, confidence_level) {
-  if (total_count == 0) {
-    return(c(lower = NA_real_, upper = NA_real_))
-  }
-
-  alpha <- 1 - confidence_level
-  alpha_half <- alpha / 2
-  lower <- if (positive_count == 0) {
-    0
-  } else {
-    stats::qbeta(alpha_half, positive_count, total_count - positive_count + 1)
-  }
-  upper <- if (positive_count == total_count) {
-    1
-  } else {
-    stats::qbeta(1 - alpha_half, positive_count + 1, total_count - positive_count)
-  }
-
-  c(lower = lower, upper = upper)
-}
-
-probability_bin_table <- function(data, confidence_level_percent = 95) {
-  confidence_level <- pmin(pmax(confidence_level_percent / 100, 0.80), 0.95)
-  alpha <- 1 - confidence_level
-  alpha_half <- alpha / 2
-  breaks <- seq(0, 1, by = 0.1)
-  bin_starts <- head(breaks, -1)
-  bin_ends <- tail(breaks, -1)
-  labels <- paste0(
-    "[", scales::percent(bin_starts, accuracy = 1),
-    ", ", scales::percent(bin_ends, accuracy = 1),
-    if_else(bin_ends == 1, "]", ")")
-  )
-  bin_lookup <- tibble(
-    score_bin = factor(labels, levels = labels),
-    bin_start = bin_starts,
-    bin_end = bin_ends,
-    bin_midpoint = (bin_starts + bin_ends) / 2
-  )
-
-  data %>%
-    mutate(
-      score_bin = cut(pmin(score, 1 - 1e-12),
-        breaks = breaks, labels = labels,
-        include.lowest = TRUE, right = FALSE
-      ),
-      positive = truth == levels(truth)[[1]]
-    ) %>%
-    count(score_bin, wt = positive, name = "Positive Count") %>%
-    right_join(
-      data %>%
-        mutate(score_bin = cut(pmin(score, 1 - 1e-12),
-          breaks = breaks, labels = labels,
-          include.lowest = TRUE, right = FALSE
-        )) %>%
-        count(score_bin, name = "Total Count"),
-      by = "score_bin"
-    ) %>%
-    complete(
-      score_bin = factor(labels, levels = labels),
-      fill = list(`Positive Count` = 0, `Total Count` = 0)
-    ) %>%
-    left_join(bin_lookup, by = "score_bin") %>%
-    mutate(
-      `Positive Count` = replace_na(`Positive Count`, 0),
-      `Total Count` = replace_na(`Total Count`, 0)
-    ) %>%
-    mutate(
-      `Positive Rate` = if_else(`Total Count` > 0, `Positive Count` / `Total Count`, NA_real_),
-      ci = map2(
-        `Positive Count`, `Total Count`,
-        ~ binomial_confidence_interval(.x, .y, confidence_level)
-      ),
-      `CI Lower` = map_dbl(ci, 1),
-      `CI Upper` = map_dbl(ci, 2),
-      Tooltip = paste0(
-        "<b>Probability Bin: ", score_bin, "</b>",
-        "<br>Total Count: ", `Total Count`,
-        "<br>Positive Count: ", `Positive Count`,
-        "<br>Positive Rate: ", scales::percent(`Positive Rate`, accuracy = 0.1),
-        "<br>", scales::percent(confidence_level, accuracy = 1), " CI: [",
-        scales::percent(`CI Lower`, accuracy = 0.1),
-        ", ", scales::percent(`CI Upper`, accuracy = 0.1), "]",
-        "<br>Alpha: ", scales::number(alpha, accuracy = 0.001),
-        "<br>Alpha / 2: ", scales::number(alpha_half, accuracy = 0.001)
-      )
-    ) %>%
-    select(-ci)
-}
-
-safe_divide <- function(numerator, denominator, default = NA_real_) {
-  output_length <- max(length(numerator), length(denominator), length(default))
-  numerator <- rep(numerator, length.out = output_length)
-  denominator <- rep(denominator, length.out = output_length)
-  default <- rep(default, length.out = output_length)
-  invalid <- denominator == 0 | is.na(denominator)
-  result <- numerator / denominator
-  result[invalid] <- default[invalid]
-  result
-}
-
-binary_positive <- function(data) {
-  data$truth == levels(data$truth)[[1]]
-}
-
-binary_confusion_counts <- function(data, threshold = NULL) {
-  positive <- binary_positive(data)
-  predicted_positive <- if (is.null(threshold)) {
-    data$estimate == levels(data$truth)[[1]]
-  } else {
-    data$score >= threshold
-  }
-
-  tibble(
-    TP = sum(predicted_positive & positive, na.rm = TRUE),
-    TN = sum(!predicted_positive & !positive, na.rm = TRUE),
-    FP = sum(predicted_positive & !positive, na.rm = TRUE),
-    FN = sum(!predicted_positive & positive, na.rm = TRUE)
-  )
-}
-
-mcc_from_counts <- function(tp, tn, fp, fn) {
-  tp <- as.numeric(tp)
-  tn <- as.numeric(tn)
-  fp <- as.numeric(fp)
-  fn <- as.numeric(fn)
-  denominator <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-  if_else(denominator == 0 | is.na(denominator), 0, (tp * tn - fp * fn) / denominator)
-}
-
-mcc_value <- function(data, threshold = NULL) {
-  counts <- binary_confusion_counts(data, threshold)
-  mcc_from_counts(counts$TP, counts$TN, counts$FP, counts$FN)
-}
-
-binary_sorted_data <- function(data) {
-  data %>%
-    mutate(
-      row_id = row_number(),
-      positive = binary_positive(data)
-    ) %>%
-    arrange(desc(score), row_id)
-}
-
-threshold_capture_summary <- function(data, threshold) {
-  positive <- binary_positive(data)
-  selected <- data$score >= threshold
-  total_count <- nrow(data)
-  total_positive <- sum(positive, na.rm = TRUE)
-  selected_count <- sum(selected, na.rm = TRUE)
-  captured_positive <- sum(selected & positive, na.rm = TRUE)
-  prevalence <- safe_divide(total_positive, total_count)
-  precision <- safe_divide(captured_positive, selected_count)
-
-  tibble(
-    threshold = threshold,
-    population_count = selected_count,
-    population_pct = safe_divide(selected_count, total_count, 0),
-    captured_positive = captured_positive,
-    cumulative_recall = safe_divide(captured_positive, total_positive, 0),
-    cumulative_precision = precision,
-    lift = safe_divide(precision, prevalence),
-    Tooltip = paste0(
-      "<b>Selected Threshold: ", scales::number(threshold, accuracy = 0.001), "</b>",
-      "<br>Cumulative Population: ", scales::percent(safe_divide(selected_count, total_count, 0), accuracy = 0.1),
-      "<br>Captured Positives: ", captured_positive, " / ", total_positive,
-      "<br>Cumulative Recall: ", scales::percent(safe_divide(captured_positive, total_positive, 0), accuracy = 0.1),
-      "<br>Cumulative Precision: ", scales::percent(precision, accuracy = 0.1),
-      "<br>Lift: ", scales::number(safe_divide(precision, prevalence), accuracy = 0.001)
-    )
-  )
-}
-
-lift_gains_table <- function(data) {
-  sorted <- binary_sorted_data(data)
-  total_count <- nrow(sorted)
-  total_positive <- sum(sorted$positive, na.rm = TRUE)
-  prevalence <- safe_divide(total_positive, total_count)
-
-  gains <- sorted %>%
-    mutate(
-      rank = row_number(),
-      cumulative_population = safe_divide(rank, total_count, 0),
-      cumulative_positive = cumsum(positive),
-      cumulative_recall = safe_divide(cumulative_positive, total_positive, 0),
-      cumulative_precision = safe_divide(cumulative_positive, rank),
-      cumulative_lift = safe_divide(cumulative_precision, prevalence),
-      approx_threshold = score,
-      Tooltip = paste0(
-        "<b>Cumulative Population: ", scales::percent(cumulative_population, accuracy = 0.1), "</b>",
-        "<br>Approx Threshold: ", scales::number(approx_threshold, accuracy = 0.001),
-        "<br>Captured Positives: ", cumulative_positive, " / ", total_positive,
-        "<br>Cumulative Recall: ", scales::percent(cumulative_recall, accuracy = 0.1),
-        "<br>Cumulative Precision: ", scales::percent(cumulative_precision, accuracy = 0.1),
-        "<br>Lift: ", scales::number(cumulative_lift, accuracy = 0.001)
-      )
-    )
-
-  bind_rows(
-    tibble(
-      rank = 0,
-      cumulative_population = 0,
-      cumulative_positive = 0,
-      cumulative_recall = 0,
-      cumulative_precision = NA_real_,
-      cumulative_lift = NA_real_,
-      approx_threshold = NA_real_,
-      Tooltip = "<b>Cumulative Population: 0%</b>"
-    ),
-    gains %>% select(rank, cumulative_population, cumulative_positive, cumulative_recall,
-      cumulative_precision, cumulative_lift, approx_threshold, Tooltip
-    )
-  )
-}
-
-ks_table <- function(data) {
-  positive <- binary_positive(data)
-  total_positive <- sum(positive, na.rm = TRUE)
-  total_negative <- sum(!positive, na.rm = TRUE)
-
-  data %>%
-    transmute(score, positive) %>%
-    group_by(score) %>%
-    summarise(
-      positive_count = sum(positive, na.rm = TRUE),
-      negative_count = sum(!positive, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(desc(score)) %>%
-    mutate(
-      TPR = safe_divide(cumsum(positive_count), total_positive, 0),
-      FPR = safe_divide(cumsum(negative_count), total_negative, 0),
-      KS = abs(TPR - FPR),
-      Tooltip = paste0(
-        "<b>Threshold: ", scales::number(score, accuracy = 0.001), "</b>",
-        "<br>TPR: ", scales::number(TPR, accuracy = 0.001),
-        "<br>FPR: ", scales::number(FPR, accuracy = 0.001),
-        "<br>KS: ", scales::number(KS, accuracy = 0.001)
-      )
-    ) %>%
-    arrange(score)
-}
-
-ks_at_threshold <- function(data, threshold) {
-  positive <- binary_positive(data)
-  selected <- data$score >= threshold
-  total_positive <- sum(positive, na.rm = TRUE)
-  total_negative <- sum(!positive, na.rm = TRUE)
-  tpr <- safe_divide(sum(selected & positive, na.rm = TRUE), total_positive, 0)
-  fpr <- safe_divide(sum(selected & !positive, na.rm = TRUE), total_negative, 0)
-
-  tibble(
-    score = threshold,
-    TPR = tpr,
-    FPR = fpr,
-    KS = abs(tpr - fpr),
-    Tooltip = paste0(
-      "<b>Selected Threshold: ", scales::number(threshold, accuracy = 0.001), "</b>",
-      "<br>TPR: ", scales::number(tpr, accuracy = 0.001),
-      "<br>FPR: ", scales::number(fpr, accuracy = 0.001),
-      "<br>KS: ", scales::number(abs(tpr - fpr), accuracy = 0.001)
-    )
-  )
-}
-
-current_threshold_decile <- function(data, threshold) {
-  total_count <- nrow(data)
-  selected_count <- sum(data$score >= threshold, na.rm = TRUE)
-  if (total_count == 0) {
-    return(NA_integer_)
-  }
-
-  pmin(10L, pmax(1L, ceiling(pmax(selected_count, 1) / total_count * 10)))
-}
-
-decile_analysis_table <- function(data, threshold) {
-  sorted <- binary_sorted_data(data)
-  total_count <- nrow(sorted)
-  total_positive <- sum(sorted$positive, na.rm = TRUE)
-  prevalence <- safe_divide(total_positive, total_count)
-  highlighted_decile <- current_threshold_decile(data, threshold)
-
-  sorted %>%
-    mutate(decile = pmin(10L, ceiling(row_number() * 10 / total_count))) %>%
-    group_by(decile) %>%
-    summarise(
-      Observations = n(),
-      `Average Score` = mean(score),
-      Positives = sum(positive, na.rm = TRUE),
-      `Positive Rate` = safe_divide(Positives, Observations),
-      Lift = safe_divide(`Positive Rate`, prevalence),
-      .groups = "drop"
-    ) %>%
-    complete(
-      decile = 1:10,
-      fill = list(Observations = 0, Positives = 0)
-    ) %>%
-    arrange(decile) %>%
-    mutate(
-      `Average Score` = replace(`Average Score`, Observations == 0, NA_real_),
-      `Positive Rate` = replace(`Positive Rate`, Observations == 0, NA_real_),
-      Lift = replace(Lift, Observations == 0, NA_real_),
-      `Cumulative Positives` = cumsum(Positives),
-      `Cumulative Recall` = safe_divide(`Cumulative Positives`, total_positive, 0),
-      `Current Threshold Decile` = decile == highlighted_decile,
-      Tooltip = paste0(
-        "<b>Decile ", decile, "</b>",
-        "<br>Observations: ", Observations,
-        "<br>Average Score: ", scales::number(`Average Score`, accuracy = 0.001),
-        "<br>Positives: ", Positives,
-        "<br>Positive Rate: ", scales::percent(`Positive Rate`, accuracy = 0.1),
-        "<br>Lift: ", scales::number(Lift, accuracy = 0.001),
-        "<br>Cumulative Positives: ", `Cumulative Positives`,
-        "<br>Cumulative Recall: ", scales::percent(`Cumulative Recall`, accuracy = 0.1)
-      )
-    )
-}
-
-calibration_table <- function(data) {
-  breaks <- seq(0, 1, by = 0.1)
-  bin_starts <- head(breaks, -1)
-  bin_ends <- tail(breaks, -1)
-  labels <- paste0(
-    "[", scales::percent(bin_starts, accuracy = 1),
-    ", ", scales::percent(bin_ends, accuracy = 1),
-    if_else(bin_ends == 1, "]", ")")
-  )
-  bin_lookup <- tibble(
-    score_bin = factor(labels, levels = labels),
-    bin_start = bin_starts,
-    bin_end = bin_ends,
-    bin_midpoint = (bin_starts + bin_ends) / 2
-  )
-
-  data %>%
-    mutate(
-      score_bin = cut(pmin(score, 1 - 1e-12),
-        breaks = breaks, labels = labels,
-        include.lowest = TRUE, right = FALSE
-      ),
-      positive = binary_positive(data)
-    ) %>%
-    group_by(score_bin) %>%
-    summarise(
-      Observations = n(),
-      `Mean Predicted Probability` = mean(score),
-      `Observed Positive Rate` = mean(positive),
-      .groups = "drop"
-    ) %>%
-    complete(
-      score_bin = factor(labels, levels = labels),
-      fill = list(Observations = 0)
-    ) %>%
-    left_join(bin_lookup, by = "score_bin") %>%
-    mutate(
-      `Mean Predicted Probability` = replace(`Mean Predicted Probability`, Observations == 0, NA_real_),
-      `Observed Positive Rate` = replace(`Observed Positive Rate`, Observations == 0, NA_real_),
-      `Calibration Error` = abs(`Observed Positive Rate` - `Mean Predicted Probability`),
-      Tooltip = paste0(
-        "<b>Bin: ", score_bin, "</b>",
-        "<br>Mean Prediction: ", scales::percent(`Mean Predicted Probability`, accuracy = 0.1),
-        "<br>Observed Rate: ", scales::percent(`Observed Positive Rate`, accuracy = 0.1),
-        "<br>Calibration Error: ", scales::number(`Calibration Error`, accuracy = 0.001),
-        "<br>Observations: ", Observations
-      )
-    )
-}
-
-brier_score_value <- function(data) {
-  positive <- as.numeric(binary_positive(data))
-  if (nrow(data) == 0) {
-    return(NA_real_)
-  }
-
-  mean((data$score - positive)^2, na.rm = TRUE)
-}
-
-mcc_threshold_table <- function(data, thresholds = seq(0, 1, by = 0.01)) {
-  map_dfr(thresholds, function(threshold) {
-    counts <- binary_confusion_counts(data, threshold)
-    value <- mcc_from_counts(counts$TP, counts$TN, counts$FP, counts$FN)
-    tibble(
-      threshold = threshold,
-      MCC = value,
-      Tooltip = paste0(
-        "<b>Threshold: ", scales::number(threshold, accuracy = 0.001), "</b>",
-        "<br>MCC: ", scales::number(value, accuracy = 0.001),
-        "<br>TP: ", counts$TP,
-        "<br>TN: ", counts$TN,
-        "<br>FP: ", counts$FP,
-        "<br>FN: ", counts$FN
-      )
-    )
-  })
-}
-
-confusion_plot <- function(data) {
-  counts <- data %>%
-    count(truth, estimate, name = "Count") %>%
-    complete(truth, estimate, fill = list(Count = 0)) %>%
-    mutate(
-      Tooltip = paste0(
-        "<b>Confusion Matrix</b>",
-        "<br>Actual Class: ", truth,
-        "<br>Predicted Class: ", estimate,
-        "<br>Count: ", Count
-      )
-    )
-
-  ggplot(counts, aes(x = estimate, y = truth, fill = Count, text = Tooltip)) +
-    geom_tile(color = "white", linewidth = 1.5) +
-    geom_text(aes(label = Count), color = theme_colors$navy, fontface = "bold", size = 5) +
-    scale_fill_gradient(low = "#EAF4FB", high = theme_colors$sky) +
-    labs(title = "Confusion Matrix", x = "Predicted Class", y = "Actual Class", fill = "Count") +
-    coord_equal() +
-    theme_minimal(base_size = 12) +
-    theme(panel.grid = element_blank(), legend.position = "bottom", plot.title = element_text(face = "bold"))
-}
-
-ui <- fluidPage(
-  tags$head(
-    tags$link(rel = "stylesheet", type = "text/css", href = "styles.css"),
-    tags$title("Model Performance Studio")
-  ),
-  div(
-    class = "hero",
-    div(
-      class = "hero__content",
-      tags$p(class = "eyebrow", "MODEL PERFORMANCE STUDIO"),
-      tags$h1("Predictive Model Evaluation"),
-      tags$p(
-        class = "hero__subtitle",
-        "Confusion Matrix, ROC Curve, and Precision-Recall Curve for binary and multiclass models."
-      )
-    ),
-    div(
-      class = "hero__mark",
-      div(class = "hero__bar hero__bar--one"),
-      div(class = "hero__bar hero__bar--two"),
-      div(class = "hero__bar hero__bar--three")
-    )
-  ),
-  div(
-    class = "dashboard-layout",
-    div(
-      class = "control-sidebar",
-      div(
-        class = "panel configuration",
-        tags$h2("Analysis Settings"),
-        radioButtons(
-          "analysis_type",
-          "Model task",
-          choices = c("Classification" = "classification", "Regression" = "regression"),
-          selected = "classification",
-          inline = TRUE
-        ),
-        fileInput(
-          "file", "Results file (.csv)",
-          accept = c(".csv", "text/csv")
-        ),
-        conditionalPanel(
-          condition = "input.analysis_type == 'classification'",
-          radioButtons(
-            "model_type",
-            "Response type",
-            choices = c("Binary" = "binary", "Multiclass" = "multiclass"),
-            selected = "binary",
-            inline = TRUE
-          ),
-          uiOutput("column_selectors"),
-          conditionalPanel(
-            condition = "input.analysis_type == 'classification' && input.model_type == 'binary'",
-            sliderInput(
-              "threshold", "Threshold probability",
-              min = 0, max = 1, value = 0.5, step = 0.01
-            ),
-            numericInput(
-              "confidence_level", "Confidence level (%)",
-              value = 95, min = 80, max = 95, step = 5
-            )
-          ),
-          conditionalPanel(
-            condition = "input.analysis_type == 'classification' && input.model_type == 'multiclass'",
-            uiOutput("multiclass_focus_controls")
-          )
-        ),
-        conditionalPanel(
-          condition = "input.analysis_type == 'regression'",
-          uiOutput("regression_column_selectors"),
-          uiOutput("regression_tolerance_input"),
-          selectInput(
-            "regression_bins",
-            "Bins / quantiles",
-            choices = c("5" = 5, "10" = 10, "20" = 20),
-            selected = 10
-          ),
-          selectInput(
-            "regression_main_metric",
-            "Main metric",
-            choices = c("MAE", "RMSE", "MedAE", "Bias", "R2", "WAPE", "MAPE", "sMAPE"),
-            selected = "RMSE"
-          ),
-          selectInput(
-            "regression_quantile_sort",
-            "Quantile sort",
-            choices = c("Actual" = "actual", "Predicted" = "predicted"),
-            selected = "actual"
-          ),
-          checkboxInput("regression_show_outliers", "Show outlier highlight", value = TRUE),
-          checkboxInput("regression_log_scale", "Use log scale when valid", value = FALSE)
-        ),
-        actionButton("calculate", "Calculate results", class = "btn-calculate"),
-        uiOutput("data_notice")
-      )
-    ),
-    div(
-      class = "main-scroll",
-      uiOutput("summary_cards"),
-      div(
-        class = "panel results",
-        tags$h2(class = "results__title", "Model Results"),
-        conditionalPanel(
-          condition = "input.analysis_type == 'classification'",
-          fluidRow(
-            column(
-              6,
-              div(
-                class = "chart-card",
-                plotlyOutput("roc_plot", height = "330px"),
-                tags$p(
-                  class = "chart-description",
-                  paste(
-                    "Use this to evaluate rank separation across thresholds.",
-                    "The ROC Curve plots Sensitivity against False Positive Rate; stronger models bend toward the upper-left corner.",
-                    "The highlighted marker shows the operating point produced by the current threshold."
-                  )
-                )
-              )
-            ),
-            column(
-              6,
-              div(
-                class = "chart-card",
-                plotlyOutput("pr_plot", height = "330px"),
-                tags$p(
-                  class = "chart-description",
-                  paste(
-                    "Use this to inspect the Precision-Recall trade-off, especially when positives are scarce.",
-                    "Precision answers how many selected cases are truly positive; Recall answers how many actual positives are captured.",
-                    "The dashed diagonal is a visual baseline, and the highlighted marker follows the selected threshold."
-                  )
-                )
-              )
-            )
-          ),
-          uiOutput("binary_extra_plots"),
-          uiOutput("multiclass_extra_plots"),
-          uiOutput("business_validation_insights"),
-          uiOutput("multiclass_business_validation_insights"),
-          fluidRow(
-            column(
-              5,
-              div(
-                class = "chart-card",
-                plotlyOutput("matrix_plot", height = "365px"),
-                tags$p(
-                  class = "chart-description",
-                  paste(
-                    "Use this to see the classification counts at the selected threshold.",
-                    "The diagonal cells are correct predictions; off-diagonal cells are errors and help identify which classes are confused."
-                  )
-                )
-              )
-            ),
-            column(
-              7,
-              div(
-                class = "metrics-card",
-                tags$h3("Performance Metrics"),
-                div(class = "metrics-table", tableOutput("metrics_table")),
-                tags$p(
-                  class = "chart-description",
-                  paste(
-                    "Use these metrics to summarize model quality.",
-                    "Threshold-based metrics such as Accuracy, Precision, Recall, F1 Score, and MCC update with the slider; ROC AUC and PR AUC summarize ranking performance across thresholds."
-                  )
-                )
-              )
-            )
-          )
-        ),
-        conditionalPanel(
-          condition = "input.analysis_type == 'regression'",
-          uiOutput("regression_results")
-        ),
-        tags$details(
-          class = "data-details",
-          tags$summary("Uploaded Data Preview"),
-          div(class = "preview-table", tableOutput("preview_table")),
-          conditionalPanel(
-            condition = "input.analysis_type == 'classification'",
-            tags$p(
-              class = "chart-description",
-              "Use this table to quickly verify that the uploaded file, Actual Class column, and probability columns were mapped as expected."
-            )
-          ),
-          conditionalPanel(
-            condition = "input.analysis_type == 'regression'",
-            tags$p(
-              class = "chart-description",
-              "Use this table to quickly verify that the uploaded file, Actual / y_true column, and Predicted / y_pred column were mapped as expected."
-            )
-          )
-        )
-      )
-    )
-  )
-)
-
 server <- function(input, output, session) {
+  analysis_ready <- reactiveVal(FALSE)
+  llm_report <- reactiveVal(NULL)
+  llm_report_error <- reactiveVal(NULL)
+
   uploaded_data <- reactive({
     req(input$file)
 
@@ -1439,6 +377,43 @@ server <- function(input, output, session) {
     )
   })
 
+  observeEvent(input$file, {
+    analysis_ready(FALSE)
+    llm_report(NULL)
+    llm_report_error(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$analysis_type, {
+    analysis_ready(FALSE)
+    llm_report(NULL)
+    llm_report_error(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$model_type, {
+    analysis_ready(FALSE)
+    llm_report(NULL)
+    llm_report_error(NULL)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$calculate, {
+    llm_report(NULL)
+    llm_report_error(NULL)
+
+    tryCatch(
+      {
+        if (input$analysis_type == "regression") {
+          regression_config()
+        } else {
+          analysis_config()
+        }
+        analysis_ready(TRUE)
+      },
+      error = function(error) {
+        analysis_ready(FALSE)
+      }
+    )
+  }, ignoreInit = TRUE)
+
   analysis_data <- reactive({
     config <- analysis_config()
 
@@ -1504,6 +479,133 @@ server <- function(input, output, session) {
     } else {
       tags$p(class = "notice", paste(config$omitted, "incomplete rows were excluded."))
     }
+  })
+
+  output$llm_controls <- renderUI({
+    if (!isTRUE(analysis_ready())) {
+      return(tags$p(
+        class = "notice",
+        "Run Calculate results successfully to enable the local AI report."
+      ))
+    }
+
+    div(
+      class = "ai-controls",
+      tags$h3("AI report"),
+      radioButtons(
+        "llm_report_language",
+        "Report language",
+        choices = c("Spanish" = "Spanish", "English" = "English"),
+        selected = "Spanish"
+      ),
+      radioButtons(
+        "llm_model",
+        "Local Ollama model",
+        choices = c("qwen2.5:7b", "llama3.1:8b", "mistral:7b"),
+        selected = "qwen2.5:7b"
+      ),
+      actionButton("generate_report", "Generate report", class = "btn-calculate")
+    )
+  })
+
+  current_llm_payload <- reactive({
+    req(analysis_ready())
+
+    if (input$analysis_type == "regression") {
+      config <- regression_config()
+      return(build_llm_report_payload(
+        analysis_type = "regression",
+        config = config,
+        data = config$data,
+        inputs = list(
+          target = input$regression_actual_col,
+          prediction = input$regression_predicted_col
+        )
+      ))
+    }
+
+    config <- analysis_config()
+    data <- analysis_data()
+    build_llm_report_payload(
+      analysis_type = "classification",
+      config = config,
+      data = data,
+      inputs = list(
+        target = input$truth_col,
+        prediction = if (config$type == "binary") input$score_col else "highest_probability_class",
+        threshold = if (config$type == "binary") input$threshold else NULL
+      )
+    )
+  })
+
+  observeEvent(input$generate_report, {
+    req(analysis_ready())
+    payload <- current_llm_payload()
+    model <- if (is.null(input$llm_model)) "qwen2.5:7b" else input$llm_model
+    language <- if (is.null(input$llm_report_language)) "Spanish" else input$llm_report_language
+
+    llm_report(NULL)
+    llm_report_error(NULL)
+    updateTabsetPanel(session, "results_tabs", selected = "AI Report")
+
+    tryCatch(
+      {
+        report <- withProgress(message = "Generating local AI report with Ollama...", value = 0, {
+          incProgress(0.25, detail = "Building compact model summary")
+          incProgress(0.35, detail = paste("Calling", model, "locally"))
+          generate_llm_report(payload, model = model, language = language)
+        })
+        llm_report(report)
+        showNotification("Local AI report generated with Ollama.", type = "message")
+      },
+      error = function(error) {
+        friendly_message <- paste0(
+          "I could not generate the local AI report. Make sure Ollama is running and the selected model is downloaded. ",
+          "If this app is deployed, Ollama must be running on the deployment server; a deployed app cannot use Ollama from your laptop. ",
+          "On macOS with Homebrew, try: brew services start ollama. ",
+          "For a one-session server, try: ollama serve. ",
+          "Then download the model with: ollama pull ", model, ". ",
+          "Details: ", conditionMessage(error)
+        )
+        llm_report_error(friendly_message)
+        showNotification(friendly_message, type = "error", duration = 12)
+      }
+    )
+  })
+
+  output$llm_report_panel <- renderUI({
+    if (!isTRUE(analysis_ready())) {
+      return(div(
+        class = "ai-report-empty",
+        tags$h3("Interpretive model report"),
+        tags$p("Run Calculate results successfully before generating an AI report.")
+      ))
+    }
+
+    error_message <- llm_report_error()
+    if (!is.null(error_message)) {
+      return(div(
+        class = "ai-report-empty",
+        tags$h3("Interpretive model report"),
+        tags$p(class = "notice", error_message)
+      ))
+    }
+
+    report <- llm_report()
+    if (is.null(report)) {
+      return(div(
+        class = "ai-report-empty",
+        tags$h3("Interpretive model report"),
+        tags$p(
+          "Use Generate report after updating the analysis. The app will send only compact metrics, summaries, and chart descriptions to your local Ollama model."
+        )
+      ))
+    }
+
+    div(
+      class = "ai-report-body",
+      HTML(markdown_report_to_html(report))
+    )
   })
 
   output$summary_cards <- renderUI({
@@ -3349,23 +2451,39 @@ server <- function(input, output, session) {
     config <- regression_config()
     data <- regression_plot_data()
     xaxis <- list(title = "Predicted", type = if (config$log_scale) "log" else "linear")
+    status_colors <- c(
+      "Within Tolerance" = theme_colors$bright_blue,
+      "Outside Tolerance" = "#F7893B",
+      "Outlier" = "#C43131"
+    )
+    segment_data <- data %>%
+      filter(is.finite(predicted), is.finite(error)) %>%
+      mutate(segment_id = row_number()) %>%
+      select(segment_id, predicted, error, PointStatus, Tooltip) %>%
+      tidyr::uncount(3, .id = "segment_point") %>%
+      mutate(
+        x = if_else(segment_point == 3, NA_real_, predicted),
+        y = case_when(
+          segment_point == 1 ~ 0,
+          segment_point == 2 ~ error,
+          TRUE ~ NA_real_
+        ),
+        Tooltip = if_else(segment_point == 3, NA_character_, Tooltip)
+      )
 
     plot_ly() %>%
       add_trace(
-        data = data,
-        x = ~predicted,
-        y = ~error,
+        data = segment_data,
+        x = ~x,
+        y = ~y,
         color = ~PointStatus,
-        colors = c(
-          "Within Tolerance" = theme_colors$bright_blue,
-          "Outside Tolerance" = "#F7893B",
-          "Outlier" = "#C43131"
-        ),
+        colors = status_colors,
         type = "scatter",
-        mode = "markers",
+        mode = "lines",
         text = ~Tooltip,
         hoverinfo = "text",
-        marker = list(size = 7, opacity = 0.72)
+        line = list(width = 1.6),
+        opacity = 0.72
       ) %>%
       add_trace(
         x = range(data$predicted, na.rm = TRUE),
@@ -3657,5 +2775,3 @@ server <- function(input, output, session) {
     uploaded_data() %>% slice_head(n = 10)
   }, striped = TRUE, spacing = "s")
 }
-
-shinyApp(ui = ui, server = server)
